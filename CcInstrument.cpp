@@ -38,11 +38,9 @@ struct CcInstrument : public FunctionPass {
     Value* name_str_array = new GlobalVariable(*F.getParent(),
         name_str_array_init->getType(), true, GlobalValue::PrivateLinkage,
         name_str_array_init, "trace_name");
-    errs() << "name_str_array: "; name_str_array->getType()->print(errs()); errs() << '\n';
     Value* gep_idxs[2] = { zero, zero };
     Value* name_str = GetElementPtrInst::CreateInBounds(
         name_str_array, gep_idxs, "trace_name", first_inst);
-    errs() << "name_str: "; name_str->getType()->print(errs()); errs() << '\n';
 
     Value* trace_args[1 + TRACE_NUM_ARGS] = {name_str, 0};
     for (size_t i = 0; i < TRACE_NUM_ARGS ; ++i) {
@@ -68,8 +66,6 @@ struct CcInstrument : public FunctionPass {
         trace_args[j] = zero;
       }
     }
-
-    errs() << "fty_trace: "; fty_trace->print(errs()); errs() << '\n';
 
     CallInst::Create(fty_trace, func_trace, trace_args, "", first_inst);
 
