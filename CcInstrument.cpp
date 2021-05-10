@@ -16,6 +16,10 @@ struct CcInstrument : public FunctionPass {
   CcInstrument() : FunctionPass(ID) {}
 
   bool runOnFunction(Function &F) override {
+    if (F.getName() == "__cc_trace_exec") {
+      return false;
+    }
+
     IntegerType* ty_word = IntegerType::get(F.getContext(), WORD_SIZE);
     IntegerType* ty_byte = IntegerType::get(F.getContext(), 8);
     Type* ty_string = ty_byte->getPointerTo();
