@@ -1,3 +1,11 @@
+// The `--unroll-vectors` pass eliminates vector `load`, `store`, `phi`,
+// `insertelement`, and `extractelement` instructions by expanding them into
+// sequences of scalar instructions.  This covers the remaining cases that may
+// be left over after running the built-in `--scalarizer` pass.
+//
+// Note that the pass does not delete the vector operations on its own, but it
+// does leave them unused whenever possible, so that `--dce` can eliminate
+// them.
 #include "llvm/Pass.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -74,7 +82,7 @@ struct UnrollVectors : public FunctionPass {
 
       for (Instruction& I : *BB) {
         if (!handleKnownInst(&I, UnrollMap)) {
-          // Check if this instruction uses any unrolled value.
+          // TODO: Error if this instruction uses any unrolled value.
         }
       }
     }
@@ -201,7 +209,8 @@ struct UnrollVectors : public FunctionPass {
       return true;
 
     } else if (auto Store = dyn_cast<StoreInst>(I)) {
-      return false;  // TODO
+      // TODO: handle StoreInst
+      return false;
 
     } else {
       return false;
