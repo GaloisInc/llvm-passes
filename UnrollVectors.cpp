@@ -88,7 +88,12 @@ struct UnrollVectors : public FunctionPass {
         Value* IncVal = PHI->getIncomingValue(i);
 
         auto it = UnrollMap.find(IncVal);
-        assert(it != UnrollMap.end() && "failed to find incoming value for unrolled phi node");
+        if (it == UnrollMap.end()) {
+          llvm::errs() << "failed to find incoming value for unrolled phi node:\n";
+          llvm::errs() << "  phi node: " << *PHI << "\n";
+          llvm::errs() << "  incoming value: " << *IncVal << "\n";
+          abort();
+        }
         SmallVector<Value*, 2>& IncElems = it->second;
 
         for (unsigned j = 0; j < Count; ++j) {
