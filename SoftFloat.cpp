@@ -20,10 +20,9 @@ const char* typeName(Type* T) {
     return "df";
   } else if (auto IntTy = dyn_cast<IntegerType>(T)) {
     switch (IntTy->getBitWidth()) {
-      // int == int32_t
       case 32: return "si";
-      // long == long long == int64_t
       case 64: return "di";
+      case 128: return "ti";
     }
   }
   llvm::errs() << "unsupported type: " << *T << "\n";
