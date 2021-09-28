@@ -42,12 +42,41 @@ FunctionCallee getConvert(Module* M,
   return M->getOrInsertFunction(Name, RetTy, ArgTy);
 }
 
-void replaceConvert(Module* M, Instruction& I, StringRef Prefix, StringRef Suffix) {
+void replaceConvert(Module* M, Instruction& I, StringRef Prefix, StringRef Suffix, bool Signed) {
   Value* Arg = I.getOperand(0);
+
+  Type* ArgTy = Arg->getType();
+  Type* RetTy = I.getType();
+  Type* OrigRetTy = RetTy;
+
+  if (auto ArgIntTy = dyn_cast<IntegerType>(ArgTy)) {
+    if (ArgIntTy->getBitWidth() < 32) {
+      // Extend argument before conversion.
+      ArgTy = IntegerType::get(M->getContext(), 32);
+      if (Signed) {
+        Arg = new SExtInst(Arg, ArgTy, I.getName(), &I);
+      } else {
+        Arg = new ZExtInst(Arg, ArgTy, I.getName(), &I);
+      }
+    }
+  }
+
+  if (auto RetIntTy = dyn_cast<IntegerType>(RetTy)) {
+    if (RetIntTy->getBitWidth() < 32) {
+      RetTy = IntegerType::get(M->getContext(), 32);
+    }
+  }
+
   FunctionCallee Func = getConvert(M, Prefix, Suffix, Arg->getType(), I.getType());
   Value* Args[1] = { Arg };
   CallInst* Call = CallInst::Create(Func, Args, I.getName(), &I);
-  I.replaceAllUsesWith(Call);
+
+  Value* Result = Call;
+  if (RetTy != OrigRetTy) {
+    Result = new TruncInst(Result, OrigRetTy, I.getName(), &I);
+  }
+
+  I.replaceAllUsesWith(Result);
 }
 
 // Get the declaration of a function of type `T -> T`.  The name will be
@@ -224,27 +253,27 @@ struct SoftFloat : public FunctionPass {
         if (auto Cast = dyn_cast<CastInst>(&I)) {
           switch (Cast->getOpcode()) {
             case Instruction::FPToUI:
-              replaceConvert(M, I, "__fixuns", "");
+              replaceConvert(M, I, "__fixuns", "", false);
               ToErase.push_back(&I);
               break;
             case Instruction::FPToSI:
-              replaceConvert(M, I, "__fix", "");
+              replaceConvert(M, I, "__fix", "", true);
               ToErase.push_back(&I);
               break;
             case Instruction::UIToFP:
-              replaceConvert(M, I, "__floatuns", "");
+              replaceConvert(M, I, "__floatuns", "", false);
               ToErase.push_back(&I);
               break;
             case Instruction::SIToFP:
-              replaceConvert(M, I, "__float", "");
+              replaceConvert(M, I, "__float", "", true);
               ToErase.push_back(&I);
               break;
             case Instruction::FPExt:
-              replaceConvert(M, I, "__extend", "2");
+              replaceConvert(M, I, "__extend", "2", false);
               ToErase.push_back(&I);
               break;
             case Instruction::FPTrunc:
-              replaceConvert(M, I, "__trunc", "2");
+              replaceConvert(M, I, "__trunc", "2", false);
               ToErase.push_back(&I);
               break;
           }
