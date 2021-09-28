@@ -261,7 +261,7 @@ struct SoftFloat : public FunctionPass {
               ToErase.push_back(&I);
               break;
             case Instruction::UIToFP:
-              replaceConvert(M, I, "__floatuns", "", false);
+              replaceConvert(M, I, "__floatun", "", false);
               ToErase.push_back(&I);
               break;
             case Instruction::SIToFP:
