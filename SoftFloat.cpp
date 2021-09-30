@@ -67,7 +67,7 @@ void replaceConvert(Module* M, Instruction& I, StringRef Prefix, StringRef Suffi
     }
   }
 
-  FunctionCallee Func = getConvert(M, Prefix, Suffix, Arg->getType(), I.getType());
+  FunctionCallee Func = getConvert(M, Prefix, Suffix, ArgTy, RetTy);
   Value* Args[1] = { Arg };
   CallInst* Call = CallInst::Create(Func, Args, I.getName(), &I);
 
