@@ -235,7 +235,7 @@ void State::unwind() {
 
       LandingPadInst* Pad = cast<LandingPadInst>(&SF.UnwindDest->front());
       UC.LandingPads.push_back(Pad);
-      Value* PHI = PHINode::Create(ReturnType, 0, "unwindval", UC.UnwindDest);
+      Value* PHI = PHINode::Create(Pad->getType(), 0, "unwindval", UC.UnwindDest);
 
       SF.Locals[Pad] = PHI;
     }
