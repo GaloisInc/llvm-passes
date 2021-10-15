@@ -288,6 +288,32 @@ bool State::step() {
     }
   }
 
+  if (auto Return = dyn_cast<ReturnInst>(Inst)) {
+    if (Stack.size() == 1) {
+      // Returning from the top-level function should just be passed through.
+      return false;
+    }
+
+    // We're about to destroy `SF`, so map the return value first.
+    Value* OldVal = Return->getReturnValue();
+    Value* NewVal = nullptr;
+    if (OldVal != nullptr) {
+      NewVal = SF.mapValue(OldVal);
+    }
+    Stack.pop_back();
+
+    StackFrame& PrevSF = Stack.back();
+    if (PrevSF.ReturnValue != nullptr) {
+      PrevSF.Locals[PrevSF.ReturnValue] = NewVal;
+    }
+    PrevSF.ReturnValue = nullptr;
+    PrevSF.UnwindDest = nullptr;
+
+    Inst->deleteValue();
+    // `PrevSF.Iter` was already updated when the call was processed.
+    return true;
+  }
+
   if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
     EvalCache.try_emplace(Alloca, LinearPtr(Alloca));
   } else if (Inst->isTerminator()) {
