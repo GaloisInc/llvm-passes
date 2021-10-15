@@ -347,7 +347,8 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     if (PrevUC != nullptr) {
       BranchInst::Create(PrevUC->ReturnDest, Out);
       PHINode* PHI = cast<PHINode>(&*PrevUC->ReturnDest->begin());
-      PHI->addIncoming(Return->getReturnValue(), Out);
+      Value* NewVal = mapValue(Return->getReturnValue());
+      PHI->addIncoming(NewVal, Out);
       return;
     }
   }
@@ -356,7 +357,8 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     if (PrevUC != nullptr && PrevUC->UnwindDest != nullptr) {
       BranchInst::Create(PrevUC->UnwindDest, Out);
       PHINode* PHI = cast<PHINode>(&*PrevUC->UnwindDest->begin());
-      PHI->addIncoming(Resume->getValue(), Out);
+      Value* NewVal = mapValue(Resume->getValue());
+      PHI->addIncoming(NewVal, Out);
       return;
     }
   }
