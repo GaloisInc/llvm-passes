@@ -376,6 +376,19 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
   NewInst->setName(Inst->getName());
   Out->getInstList().push_back(NewInst);
 
+  errs() << "emitInst " << *Inst << "\n";
+  for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
+    Value* OldVal = Inst->getOperand(I);
+    if (auto OldBB = dyn_cast<BasicBlock>(OldVal)) {
+      BasicBlock* NewBB = mapBlock(OldBB);
+      NewInst->setOperand(I, NewBB);
+    } else {
+      Value* NewVal = mapValue(OldVal);
+      errs() << "  operand " << I << ": " << OldVal << " " << *OldVal << " -> " << NewVal << " " << *NewVal << "\n";
+      NewInst->setOperand(I, NewVal);
+    }
+  }
+
   if (auto LandingPad = dyn_cast<LandingPadInst>(Inst)) {
     if (PrevUC != nullptr) {
       // Accumulate clauses from enclosing landing pads.  According to the LLVM
@@ -396,16 +409,17 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     }
   }
 
-  errs() << "emitInst " << *Inst << "\n";
-  for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
-    Value* OldVal = Inst->getOperand(I);
-    if (auto OldBB = dyn_cast<BasicBlock>(OldVal)) {
-      BasicBlock* NewBB = mapBlock(OldBB);
-      NewInst->setOperand(I, NewBB);
+  if (Inst->isEHPad() || Inst->isExceptionalTerminator()) {
+    // Exception-related instructions can only appear inside a function with an
+    // EH personality.
+    Function* OldFunc = Inst->getFunction();
+    assert(OldFunc->hasPersonalityFn());
+    Constant* Personality = OldFunc->getPersonalityFn();
+    if (!S.NewFunc->hasPersonalityFn()) {
+      S.NewFunc->setPersonalityFn(Personality);
     } else {
-      Value* NewVal = mapValue(OldVal);
-      errs() << "  operand " << I << ": " << OldVal << " " << *OldVal << " -> " << NewVal << " " << *NewVal << "\n";
-      NewInst->setOperand(I, NewVal);
+      assert(S.NewFunc->getPersonalityFn() == Personality &&
+          "mismatch between different personality functions");
     }
   }
 
