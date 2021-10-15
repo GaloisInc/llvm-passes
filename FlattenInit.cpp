@@ -122,7 +122,7 @@ struct LinearPtr {
   /// Try to interpret this as a base-plus-offset expression, and return the
   /// base.  A base of `nullptr` indicates that no pointers are involved in
   /// this expression (it's an absolute memory address instead).
-  Optional<Value*> base() const {
+  Optional<Value*> getBase() const {
     if (Terms.size() == 0) {
       return nullptr;
     } else if (Terms.size() == 1 && Terms[0].Coeff == 1) {
@@ -197,7 +197,7 @@ struct State {
   BasicBlock* NewBB;
   TargetLibraryInfo* TLI;
 
-  DenseMap<Value*, LinearPtr> EvalCache;
+  DenseMap<Value*, Optional<LinearPtr>> EvalCache;
   DenseMap<Value*, std::vector<MemStore>> Mem;
   std::vector<StackFrame> Stack;
 
@@ -232,6 +232,16 @@ struct State {
 
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
+
+  LinearPtr* evalPtr(Value* V);
+  Optional<LinearPtr> evalPtrImpl(Value* V);
+  Optional<LinearPtr> evalPtrConstant(Constant* C);
+  Optional<LinearPtr> evalPtrConstantExpr(ConstantExpr* C);
+
+  /// Wrapper around llvm::ConstantFoldConstant.
+  Constant* constantFoldConstant(Constant* C);
+  Constant* constantFoldExtra(Constant* C);
+  Constant* constantFoldAlignmentCheck(Constant* C);
 };
 
 
@@ -268,6 +278,7 @@ bool State::step() {
   // Try constant folding.
   if (Constant* C = ConstantFoldInstruction(Inst, NewFunc->getParent()->getDataLayout(), TLI)) {
     errs() << "constant folding succeeded on " << *Inst << " -> " << *C << "\n";
+    C = constantFoldExtra(C);
     SF.Locals[OldInst] = C;
     Inst->deleteValue();
     ++SF.Iter;
@@ -385,6 +396,169 @@ bool State::stepCall(
 
   Call->deleteValue();
   return true;
+}
+
+Constant* State::constantFoldConstant(Constant* C) {
+  Constant* Folded = ConstantFoldConstant(C, NewFunc->getParent()->getDataLayout(), TLI);
+  if (Folded != nullptr) {
+    return Folded;
+  } else {
+    return C;
+  }
+}
+
+/// Apply extra constant folding for certain special cases.
+Constant* State::constantFoldExtra(Constant* C) {
+  errs() << "CFE: start: " << C << " " << *C << "\n";
+  C = constantFoldAlignmentCheck(C);
+  errs() << "CFE: after constantFoldAlignmentCheck: " << C << " " << *C << "\n";
+  C = constantFoldConstant(C);
+  errs() << "CFE: after constantFoldConstant: " << C << " " << *C << "\n";
+  return C;
+}
+
+/// Fold alignment checks, like `(uintptr_t)ptr & 7`.  These appear in
+/// functions like `memcpy` and `strcmp`.  We handle these by increasing the
+/// alignment of the declaration of `ptr` so the result has a known value.
+Constant* State::constantFoldAlignmentCheck(Constant* C) {
+  auto And = dyn_cast<ConstantExpr>(C);
+  if (And == nullptr || And->getOpcode() != Instruction::And) {
+    return C;
+  }
+
+  Constant* Val = nullptr;
+  ConstantInt* Mask = nullptr;
+  if (Mask = dyn_cast<ConstantInt>(And->getOperand(0))) {
+    Val = cast<Constant>(And->getOperand(1));
+  } else if (Mask = dyn_cast<ConstantInt>(And->getOperand(1))) {
+    Val = cast<Constant>(And->getOperand(0));
+  } else {
+    return C;
+  }
+
+  if (Mask->uge(4096)) {
+    return C;
+  }
+  uint64_t MaskInt = Mask->getZExtValue();
+  // Check if MaskInt is one less than a power of two.
+  if ((MaskInt & (MaskInt + 1)) != 0) {
+    return C;
+  }
+  uint64_t Align = MaskInt + 1;
+
+  // strcmp tries to be clever, and does two alignment checks at once via
+  // `((ptr1 | ptr2) & 7) == 0`.  We handle this by reassociating the
+  // expression as `(ptr1 & 7) | (ptr2 & 7)`, then fold it recursively.
+  auto ValOr = dyn_cast<ConstantExpr>(Val);
+  if (ValOr != nullptr && ValOr->getOpcode() == Instruction::Or) {
+    Constant* C0 = constantFoldExtra(ConstantExpr::getAnd(ValOr->getOperand(0), Mask));
+    Constant* C1 = constantFoldExtra(ConstantExpr::getAnd(ValOr->getOperand(1), Mask));
+    errs() << "found or: " << *ValOr << "\n";
+    errs() << "  C0: " << *C0 << "\n";
+    errs() << "  C1: " << *C1 << "\n";
+    return constantFoldExtra(ConstantExpr::getOr(C0, C1));
+  }
+
+  // Evaluate `Val` as a base and offset pair.
+  LinearPtr* Ptr = evalPtr(Val);
+  if (Ptr == nullptr) {
+    return C;
+  }
+  Optional<Value*> OptBase = Ptr->getBase();
+  if (!OptBase.hasValue()) {
+    return C;
+  }
+  Value* Base = OptBase.getValue();
+
+  // If the base is a global variable or function, adjust its alignment to at
+  // least `Align`.
+  auto Global = dyn_cast<GlobalObject>(Base);
+  if (Global == nullptr) {
+    return C;
+  }
+
+  unsigned OldAlign = Global->getAlignment();
+  if (OldAlign < Align) {
+    Global->setAlignment(Align);
+  }
+
+  // We know `base & mask` is zero, so the result of `(base + offset) & mask`
+  // is just `offset & mask`.
+  return ConstantInt::get(Mask->getType(), Ptr->Offset & MaskInt);
+}
+
+LinearPtr* State::evalPtr(Value* V) {
+  auto It = EvalCache.find(V);
+  if (It == EvalCache.end()) {
+    Optional<LinearPtr> Ptr = evalPtrImpl(V);
+    It = EvalCache.try_emplace(V, std::move(Ptr)).first;
+  }
+  if (It->second.hasValue()) {
+    return &It->second.getValue();
+  } else {
+    return nullptr;
+  }
+}
+
+Optional<LinearPtr> State::evalPtrImpl(Value* V) {
+  if (auto C = dyn_cast<Constant>(V)) {
+    return evalPtrConstant(C);
+  } else {
+    return None;
+  }
+}
+
+Optional<LinearPtr> State::evalPtrConstant(Constant* C) {
+  if (auto Global = dyn_cast<GlobalObject>(C)) {
+    return LinearPtr(C);
+  } else if (auto Alias = dyn_cast<GlobalAlias>(C)) {
+    return evalPtrConstant(Alias->getAliasee());
+  } else if (auto Expr = dyn_cast<ConstantExpr>(C)) {
+    return evalPtrConstantExpr(Expr);
+  } else {
+    return None;
+  }
+}
+
+Optional<LinearPtr> State::evalPtrConstantExpr(ConstantExpr* C) {
+  LinearPtr* A = nullptr;
+  LinearPtr* B = nullptr;
+  switch (C->getOpcode()) {
+    case Instruction::Add:
+      A = evalPtr(C->getOperand(0));
+      B = evalPtr(C->getOperand(1));
+      if (A == nullptr || B == nullptr) {
+        return None;
+      }
+      return A->add(*B);
+
+    case Instruction::Sub:
+      A = evalPtr(C->getOperand(0));
+      B = evalPtr(C->getOperand(1));
+      if (A == nullptr || B == nullptr) {
+        return None;
+      }
+      return A->sub(*B);
+
+    case Instruction::Mul:
+      A = evalPtr(C->getOperand(0));
+      B = evalPtr(C->getOperand(1));
+      if (A == nullptr || B == nullptr) {
+        return None;
+      }
+      return A->mul(*B);
+
+    case Instruction::IntToPtr:
+    case Instruction::PtrToInt:
+      A = evalPtr(C->getOperand(0));
+      if (A == nullptr) {
+        return None;
+      }
+      return *A;
+
+    default:
+      return None;
+  }
 }
 
 
