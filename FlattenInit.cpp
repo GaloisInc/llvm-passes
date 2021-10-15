@@ -1,5 +1,6 @@
 #include "llvm/Pass.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -287,6 +288,7 @@ bool State::step() {
     }
   }
 
+
   // Try constant folding.
   if (Constant* C = ConstantFoldInstruction(Inst, NewFunc->getParent()->getDataLayout(), TLI)) {
     C = constantFoldExtra(C);
@@ -296,6 +298,10 @@ bool State::step() {
     ++SF.Iter;
     return true;
   }
+
+
+  // Instructions with special handling.  If these special cases fail, we fall
+  // through and (usually) emit the instruction unchanged.
 
   // Try to handle function calls.  This can fail if the callee is unknown or
   // not defined, in which case we pass it through as an unknown instruction.
@@ -353,14 +359,38 @@ bool State::step() {
     }
   }
 
-  if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
-    EvalCache.try_emplace(Alloca, LinearPtr(Alloca));
-  } else if (Inst->isTerminator()) {
+
+  // We can't pass through unknown terminators, because we don't know what to
+  // execute next.
+  if (Inst->isTerminator()) {
+    errs() << "unwinding due to (old) " << *OldInst << "\n";
+    errs() << "unwinding due to (new) " << *Inst << "\n";
     Inst->deleteValue();
     return false;
   }
 
-  // TODO: for unknown instructions with Inst->mayWriteToMemory(), clear all known memory
+
+  // Instructions that pass through, but with some special effect.
+  if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
+    EvalCache.try_emplace(Alloca, LinearPtr(Alloca));
+  } else if (auto Call = dyn_cast<CallInst>(Inst)) {
+    bool IsAlloc = isAllocationFn(Call, TLI);
+    bool IsFree = isFreeCall(Call, TLI);
+    if (IsAlloc || IsFree) {
+      if (IsAlloc) {
+        if (isReallocLikeFn(Call, TLI)) {
+          // TODO: return the same pointer as the input, so reads through the
+          // new pointer return writes through the old one?
+          // TODO: handle realloc(NULL, size) as an alias for malloc(size)?
+          assert(0 && "realloc NYI");
+        } else {
+          EvalCache.try_emplace(Call, LinearPtr(Call));
+        }
+      }
+    }
+  } else {
+    // TODO: for unknown instructions with Inst->mayWriteToMemory(), clear all known memory
+  }
 
   SF.Locals[OldInst] = Inst;
   NewBB->getInstList().push_back(Inst);
@@ -393,11 +423,18 @@ bool State::stepCall(
   // Make sure the callee is known.
   // TODO: handle bitcasted constants here
   Function* Callee = Call->getCalledFunction();
+  if (Callee == nullptr) {
+    return false;
+  }
   if (Callee->isVarArg()) {
     // TODO: handle vararg calls
     return false;
   }
-  // TODO: handle builtins: malloc, calloc, realloc, free, posix_memalign
+  if (isAllocationFn(Call, TLI) || isFreeCall(Call, TLI)) {
+    // Never step into malloc or free functions.  They get special handling in
+    // `step` instead.
+    return false;
+  }
   if (Callee->isDeclaration()) {
     // Function body is not available.
     return false;
