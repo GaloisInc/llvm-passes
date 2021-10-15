@@ -350,9 +350,12 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
   if (auto Return = dyn_cast<ReturnInst>(Inst)) {
     if (PrevUC != nullptr) {
       BranchInst::Create(PrevUC->ReturnDest, Out);
-      PHINode* PHI = cast<PHINode>(&*PrevUC->ReturnDest->begin());
-      Value* NewVal = mapValue(Return->getReturnValue());
-      PHI->addIncoming(NewVal, Out);
+      Value* OldVal = Return->getReturnValue();
+      if (OldVal != nullptr && !OldVal->getType()->isVoidTy()) {
+        PHINode* PHI = cast<PHINode>(&*PrevUC->ReturnDest->begin());
+        Value* NewVal = mapValue(Return->getReturnValue());
+        PHI->addIncoming(NewVal, Out);
+      }
       return;
     }
   }
