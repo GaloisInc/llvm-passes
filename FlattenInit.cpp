@@ -317,18 +317,15 @@ bool State::step() {
       return false;
     }
 
-    // We're about to destroy `SF`, so map the return value first.
-    Value* OldVal = Return->getReturnValue();
-    Value* NewVal = nullptr;
-    if (OldVal != nullptr) {
-      NewVal = SF.mapValue(OldVal);
-    }
-    Stack.pop_back();
+    // `Return` is the new instruction (with operands already mapped), so it's
+    // not invalidated when we deallocate `SF`.
+    Value* RetVal = Return->getReturnValue();
 
+    Stack.pop_back();
     StackFrame& PrevSF = Stack.back();
-    if (PrevSF.ReturnValue != nullptr && NewVal != nullptr) {
-      errs() << "step(return): map " << *PrevSF.ReturnValue << " -> " << *NewVal << "\n";
-      PrevSF.Locals[PrevSF.ReturnValue] = NewVal;
+    if (PrevSF.ReturnValue != nullptr && RetVal != nullptr) {
+      errs() << "step(return): map " << *PrevSF.ReturnValue << " -> " << *RetVal << "\n";
+      PrevSF.Locals[PrevSF.ReturnValue] = RetVal;
     }
     PrevSF.ReturnValue = nullptr;
     PrevSF.UnwindDest = nullptr;
