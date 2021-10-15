@@ -273,6 +273,10 @@ struct UnwindFrameState {
   /// List of old blocks that need to be converted.  Every block in this list
   /// will also be present as a key in BlockMap.
   std::vector<BasicBlock*> Pending;
+  /// List of all predecessors, as pairs of `OldPred` and `NewPred`.  For each
+  /// predecessor, `handlePHINodes` will update the phi nodes of all its
+  /// possible successors.
+  std::vector<std::pair<BasicBlock*, BasicBlock*>> AllPreds;
 
   /// Trampolines used for exiting partial blocks.  Partial blocks need special
   /// handling because a separate full clone of the block might also exist if
@@ -411,6 +415,12 @@ void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
     TrampBB = TrampIter->second;
   }
 
+  if (TrampBB == nullptr) {
+    AllPreds.emplace_back(BB, Out);
+  }
+  // If TrampBB is non-null, the code that created the trampoline already added
+  // it to AllPreds.
+
   for (Instruction& Inst : *BB) {
     if (TrampBB != nullptr && Inst.isTerminator()) {
       auto Iter = BB->begin();
@@ -448,6 +458,7 @@ void UnwindFrameState::emitPartialBlock(
   // Build trampoline block.
   BasicBlock* TrampBB = BasicBlock::Create(
       S.NewFunc->getContext(), BB->getName() + "_exit", S.NewFunc);
+  AllPreds.emplace_back(BB, TrampBB);
 
   for (Instruction& Inst : *BB) {
     if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
@@ -475,13 +486,9 @@ void UnwindFrameState::emitAllBlocks() {
 }
 
 void UnwindFrameState::handlePHINodes() {
-  for (auto& Entry : BlockMap) {
+  for (auto& Entry : AllPreds) {
     BasicBlock* OldPred = Entry.first;
     BasicBlock* NewPred = Entry.second;
-    auto It = ExitTrampolines.find(Entry.first);
-    if (It != ExitTrampolines.end()) {
-      NewPred = It->second;
-    }
 
     Instruction* Term = OldPred->getTerminator();
     for (unsigned I = 0; I < Term->getNumSuccessors(); ++I) {
