@@ -265,6 +265,18 @@ bool State::step() {
   Instruction* OldInst = &*SF.Iter;
   errs() << "step: " << *OldInst << "\n";
 
+  // Special case: PHINode operands for the edges not taken may refer to values
+  // that have no mapping in SF.Locals, so we must handle it before mapping
+  // operands.
+  if (auto PHI = dyn_cast<PHINode>(OldInst)) {
+    assert(SF.PrevBB != nullptr);
+    Value* OldVal = PHI->getIncomingValueForBlock(SF.PrevBB);
+    Value* NewVal = SF.mapValue(OldVal);
+    SF.Locals[PHI] = NewVal;
+    ++SF.Iter;
+    return true;
+  }
+
   Instruction* Inst(OldInst->clone());
   Inst->setName(OldInst->getName());
   for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
@@ -277,8 +289,8 @@ bool State::step() {
 
   // Try constant folding.
   if (Constant* C = ConstantFoldInstruction(Inst, NewFunc->getParent()->getDataLayout(), TLI)) {
-    errs() << "constant folding succeeded on " << *Inst << " -> " << *C << "\n";
     C = constantFoldExtra(C);
+    errs() << "step(constant): map " << *OldInst << " -> " << *C << "\n";
     SF.Locals[OldInst] = C;
     Inst->deleteValue();
     ++SF.Iter;
@@ -314,7 +326,8 @@ bool State::step() {
     Stack.pop_back();
 
     StackFrame& PrevSF = Stack.back();
-    if (PrevSF.ReturnValue != nullptr) {
+    if (PrevSF.ReturnValue != nullptr && NewVal != nullptr) {
+      errs() << "step(return): map " << *PrevSF.ReturnValue << " -> " << *NewVal << "\n";
       PrevSF.Locals[PrevSF.ReturnValue] = NewVal;
     }
     PrevSF.ReturnValue = nullptr;
@@ -323,6 +336,24 @@ bool State::step() {
     Inst->deleteValue();
     // `PrevSF.Iter` was already updated when the call was processed.
     return true;
+  }
+
+  if (auto Branch = dyn_cast<BranchInst>(Inst)) {
+    if (Branch->isUnconditional()) {
+      SF.enterBlock(Branch->getSuccessor(0));
+      Inst->deleteValue();
+      return true;
+    } else {
+      if (auto ConstCond = dyn_cast<Constant>(Branch->getCondition())) {
+        if (ConstCond->isOneValue()) {
+          SF.enterBlock(Branch->getSuccessor(0));
+        } else {
+          SF.enterBlock(Branch->getSuccessor(1));
+        }
+        Inst->deleteValue();
+        return true;
+      }
+    }
   }
 
   if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
@@ -336,6 +367,7 @@ bool State::step() {
 
   SF.Locals[OldInst] = Inst;
   NewBB->getInstList().push_back(Inst);
+  errs() << "step(unknown): map " << *OldInst << " -> " << *Inst << "\n";
   ++SF.Iter;
   return true;
 }
@@ -356,7 +388,6 @@ Value* StackFrame::mapValue(Value* OldVal) {
     errs() << "error: no local mapping for value " << *OldVal << "\n";
     assert(0 && "no local mapping for value");
   }
-  errs() << "mapValue: found mapping" << OldVal << " " << *OldVal << " -> " << It->second << " " << *It->second << "\n";
   return It->second;
 }
 
@@ -409,11 +440,8 @@ Constant* State::constantFoldConstant(Constant* C) {
 
 /// Apply extra constant folding for certain special cases.
 Constant* State::constantFoldExtra(Constant* C) {
-  errs() << "CFE: start: " << C << " " << *C << "\n";
   C = constantFoldAlignmentCheck(C);
-  errs() << "CFE: after constantFoldAlignmentCheck: " << C << " " << *C << "\n";
   C = constantFoldConstant(C);
-  errs() << "CFE: after constantFoldConstant: " << C << " " << *C << "\n";
   return C;
 }
 
