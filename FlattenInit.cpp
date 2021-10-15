@@ -178,6 +178,8 @@ struct UnwindContext {
   /// All the clauses of these landingpads will be added to landingpads in the
   /// callee.
   SmallVector<LandingPadInst*, 2> LandingPads;
+
+  UnwindContext() : ReturnDest(nullptr), UnwindDest(nullptr), LandingPads() {}
 };
 
 struct State {
