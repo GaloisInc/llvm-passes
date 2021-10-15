@@ -626,7 +626,7 @@ void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
 
   for (Instruction& Inst : *BB) {
     if (TrampBB != nullptr && Inst.isTerminator()) {
-      auto Iter = BB->begin();
+      auto Iter = TrampBB->begin();
       for (Instruction& Inst : *BB) {
         if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
           continue;
