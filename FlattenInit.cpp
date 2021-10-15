@@ -1,4 +1,6 @@
 #include "llvm/Pass.h"
+#include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -59,6 +61,10 @@ void mergeTerms(SmallVector<LinearTerm, 1>& Dest, SmallVector<LinearTerm, 1> con
 struct LinearPtr {
   SmallVector<LinearTerm, 1> Terms;
   uint64_t Offset;
+
+  LinearPtr() : Terms(), Offset(0) {}
+  explicit LinearPtr(Value* Ptr) : Terms { LinearTerm(Ptr, 1) }, Offset(0) {}
+  explicit LinearPtr(uint64_t Const) : Terms {}, Offset(Const) {}
 
   LinearPtr neg() const {
     LinearPtr Out = *this;
@@ -161,6 +167,10 @@ struct StackFrame {
     Argument* Arg = std::next(Func.arg_begin(), I);
     Locals[Arg] = V;
   }
+
+  void enterBlock(BasicBlock* BB);
+
+  Value* mapValue(Value* OldVal);
 };
 
 /// Information about the calling context, used for unwinding.
@@ -185,11 +195,14 @@ struct UnwindContext {
 struct State {
   Function* NewFunc;
   BasicBlock* NewBB;
+  TargetLibraryInfo* TLI;
 
+  DenseMap<Value*, LinearPtr> EvalCache;
   DenseMap<Value*, std::vector<MemStore>> Mem;
   std::vector<StackFrame> Stack;
 
-  State(Function& OldFunc, StringRef NewName) {
+  State(Function& OldFunc, StringRef NewName, TargetLibraryInfo* TLI)
+    : TLI(TLI) {
     NewFunc = Function::Create(
         OldFunc.getFunctionType(),
         OldFunc.getLinkage(),
@@ -198,7 +211,7 @@ struct State {
         OldFunc.getParent());
     NewFunc->copyAttributesFrom(&OldFunc);
 
-    NewBB = BasicBlock::Create(NewFunc->getContext(), "", NewFunc);
+    NewBB = BasicBlock::Create(NewFunc->getContext(), "flatinit", NewFunc);
 
     StackFrame SF(OldFunc);
     for (unsigned I = 0; I < OldFunc.arg_size(); ++I) {
@@ -207,9 +220,149 @@ struct State {
     Stack.emplace_back(std::move(SF));
   }
 
+  void run();
+  /// Process the next instruction.  Returns `true` on success, or `false` if
+  /// the next instruction can't be processed.
+  bool step();
+  /// Process a call instruction.  Control resumes at `NormalDest` on success,
+  /// or at the instruction after the call if `NormalDest` is nullptr.  For
+  /// invoke instructions, `UnwindDest` gives the landing pad (for non-invoke
+  /// calls, `UnwindDest` is nullptr).
+  bool stepCall(CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest);
+
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
 };
+
+
+// Flattening
+
+void State::run() {
+  while (step()) {
+    // No-op
+  }
+  errs() << "\n\n\n ===== UNWINDING =====\n\n\n";
+  if (Stack.size() > 0) {
+    unwind();
+  }
+}
+
+bool State::step() {
+  if (Stack.size() == 0) {
+    return false;
+  }
+  StackFrame& SF = Stack.back();
+  Instruction* OldInst = &*SF.Iter;
+  errs() << "step: " << *OldInst << "\n";
+
+  Instruction* Inst(OldInst->clone());
+  Inst->setName(OldInst->getName());
+  for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
+    Value* OldVal = Inst->getOperand(I);
+    if (!isa<BasicBlock>(OldVal)) {
+      Value* NewVal = SF.mapValue(OldVal);
+      Inst->setOperand(I, NewVal);
+    }
+  }
+
+  // Try constant folding.
+  if (Constant* C = ConstantFoldInstruction(Inst, NewFunc->getParent()->getDataLayout(), TLI)) {
+    errs() << "constant folding succeeded on " << *Inst << " -> " << *C << "\n";
+    SF.Locals[OldInst] = C;
+    Inst->deleteValue();
+    ++SF.Iter;
+    return true;
+  }
+
+  // Try to handle function calls.  This can fail if the callee is unknown or
+  // not defined, in which case we pass it through as an unknown instruction.
+  if (auto Call = dyn_cast<CallInst>(Inst)) {
+    if (stepCall(Call, cast<CallInst>(OldInst), nullptr, nullptr)) {
+      return true;
+    }
+  }
+  if (auto Invoke = dyn_cast<InvokeInst>(Inst)) {
+    if (stepCall(Invoke, cast<InvokeInst>(OldInst), 
+          Invoke->getNormalDest(), Invoke->getUnwindDest())) {
+      return true;
+    }
+  }
+
+  if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
+    EvalCache.try_emplace(Alloca, LinearPtr(Alloca));
+  } else if (Inst->isTerminator()) {
+    Inst->deleteValue();
+    return false;
+  }
+
+  // TODO: for unknown instructions with Inst->mayWriteToMemory(), clear all known memory
+
+  SF.Locals[OldInst] = Inst;
+  NewBB->getInstList().push_back(Inst);
+  ++SF.Iter;
+  return true;
+}
+
+void StackFrame::enterBlock(BasicBlock* BB) {
+  PrevBB = CurBB;
+  CurBB = BB;
+  Iter = BB->begin();
+}
+
+Value* StackFrame::mapValue(Value* OldVal) {
+  if (isa<Constant>(OldVal)) {
+    return OldVal;
+  }
+
+  auto It = Locals.find(OldVal);
+  if (It == Locals.end()) {
+    errs() << "error: no local mapping for value " << *OldVal << "\n";
+    assert(0 && "no local mapping for value");
+  }
+  errs() << "mapValue: found mapping" << OldVal << " " << *OldVal << " -> " << It->second << " " << *It->second << "\n";
+  return It->second;
+}
+
+bool State::stepCall(
+    CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest) {
+  // Make sure the callee is known.
+  // TODO: handle bitcasted constants here
+  Function* Callee = Call->getCalledFunction();
+  if (Callee->isVarArg()) {
+    // TODO: handle vararg calls
+    return false;
+  }
+  // TODO: handle builtins: malloc, calloc, realloc, free, posix_memalign
+  if (Callee->isDeclaration()) {
+    // Function body is not available.
+    return false;
+  }
+
+  // Advance the current frame past the call.
+  StackFrame& SF = Stack.back();
+  if (NormalDest == nullptr) {
+    ++SF.Iter;
+  } else {
+    SF.enterBlock(NormalDest);
+  }
+
+  SF.ReturnValue = OldCall;
+  SF.UnwindDest = UnwindDest;
+
+  // Push a new frame 
+  errs() << "enter function " << Callee->getName() << "\n";
+  StackFrame NewSF(*Callee);
+  for (unsigned I = 0; I < Call->arg_size(); ++I) {
+    NewSF.addArgument(I, Call->getArgOperand(I));
+  }
+  Stack.emplace_back(std::move(NewSF));
+
+  Call->deleteValue();
+  return true;
+}
+
+
+// Unwinding
 
 void State::unwind() {
   assert(Stack.size() > 0);
@@ -224,12 +377,16 @@ void State::unwind() {
       UC = UnwindStack.back();
     }
 
+    errs() << "build unwind context for " << SF.Func.getName() << "\n";
+
     UC.ReturnDest = BasicBlock::Create(NewFunc->getContext(), "returndest", NewFunc);
     Type* ReturnType = Stack[I + 1].Func.getReturnType();
     if (!ReturnType->isVoidTy()) {
       Value* PHI = PHINode::Create(ReturnType, 0, "returnval", UC.ReturnDest);
       assert(SF.ReturnValue != nullptr);
       SF.Locals[SF.ReturnValue] = PHI;
+      errs() << "  old return value = " << *SF.ReturnValue << "\n";
+      errs() << "  new return value = " << *PHI << "\n";
     }
 
     if (SF.UnwindDest != nullptr) {
@@ -312,6 +469,7 @@ struct UnwindFrameState {
 };
 
 void State::unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC) {
+  errs() << "unwinding out of " << SF.Func.getName() << "\n";
   UnwindFrameState UFS(*this, SF, PrevUC);
 
   if (UC == nullptr) {
@@ -523,17 +681,7 @@ void UnwindFrameState::handlePHINodes() {
 }
 
 Value* UnwindFrameState::mapValue(Value* OldVal) {
-  if (isa<Constant>(OldVal)) {
-    return OldVal;
-  }
-
-  auto It = SF.Locals.find(OldVal);
-  if (It == SF.Locals.end()) {
-    errs() << "error: no local mapping for value " << *OldVal << "\n";
-    assert(0 && "no local mapping for value");
-  }
-  errs() << "mapValue: found mapping" << OldVal << " " << *OldVal << " -> " << It->second << " " << *It->second << "\n";
-  return It->second;
+  return SF.mapValue(OldVal);
 }
 
 BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB) {
@@ -549,6 +697,8 @@ BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB) {
 }
 
 
+// LLVM pass
+
 struct FlattenInit : public ModulePass {
   static char ID;
   FlattenInit() : ModulePass(ID) {}
@@ -559,11 +709,34 @@ struct FlattenInit : public ModulePass {
       return false;
     }
 
+    TargetLibraryInfo* TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
+
     MainFunc->setName("__cc_old_main");
-    State S(*MainFunc, "main");
-    S.unwind();
+    State S(*MainFunc, "main", TLI);
+    S.run();
+
+    for (auto& BB : *S.NewFunc) {
+      for (auto& Inst : BB) {
+        for (Value* V : Inst.operand_values()) {
+          if (auto OpBB = dyn_cast<BasicBlock>(V)) {
+            if (OpBB->getParent() != S.NewFunc) {
+              errs() << "INVALID: inst " << Inst << " references basic block " << OpBB << " " << OpBB->getName() << " of function " << OpBB->getParent()->getName() << "\n";
+            }
+          } else if (auto OpInst = dyn_cast<Instruction>(V)) {
+            if (OpInst->getFunction() != S.NewFunc) {
+              errs() << "INVALID: inst " << Inst << " references instruction " << *OpInst << " of function " << OpInst->getFunction()->getName() << "\n";
+            }
+          }
+        }
+      }
+    }
 
     return true;
+  }
+
+private:
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
   }
 }; // end of struct FlattenInit
 }  // end of anonymous namespace
