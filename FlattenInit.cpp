@@ -1,5 +1,6 @@
 #include "llvm/Pass.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/BasicBlock.h"
@@ -202,8 +203,10 @@ struct State {
   DenseMap<Value*, std::vector<MemStore>> Mem;
   std::vector<StackFrame> Stack;
 
+  SimplifyQuery SQ;
+
   State(Function& OldFunc, StringRef NewName, TargetLibraryInfo* TLI)
-    : TLI(TLI) {
+    : TLI(TLI), SQ(OldFunc.getParent()->getDataLayout(), TLI) {
     NewFunc = Function::Create(
         OldFunc.getFunctionType(),
         OldFunc.getLinkage(),
@@ -295,8 +298,35 @@ bool State::step() {
   }
 
 
-  // Try constant folding.
-  if (Constant* C = constantFoldInstructionExtra(Inst)) {
+  // Try simplification and/or constant folding.
+
+  Value* Simplified = SimplifyInstruction(Inst, SQ);
+  Constant* C = nullptr;
+  if (Simplified != nullptr) {
+    if (auto SimpleConst = dyn_cast<Constant>(Simplified)) {
+      // Constants are handled below, for both simplify and constant folding.
+      C = SimpleConst;
+    } else if (auto SimpleInst = dyn_cast<Instruction>(Simplified)) {
+      // Simplify never creates an instruction; it only ever returns existing
+      // ones.
+      errs() << "step(simplify): map " << *OldInst << " -> " << *SimpleInst << "\n";
+      SF.Locals[OldInst] = SimpleInst;
+      Inst->deleteValue();
+      ++SF.Iter;
+      return true;
+    } else {
+      errs() << "bad value kind after simplify: " << *Simplified << "\n";
+      assert(0 && "bad value kind after simplify");
+    }
+  }
+
+  if (C == nullptr) {
+    if (auto FoldedConst = constantFoldInstructionExtra(Inst)) {
+      C = FoldedConst;
+    }
+  }
+
+  if (C != nullptr) {
     C = constantFoldExtra(C);
     errs() << "step(constant): map " << *OldInst << " -> " << *C << "\n";
     SF.Locals[OldInst] = C;
