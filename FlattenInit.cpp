@@ -237,12 +237,18 @@ struct State {
   LinearPtr* evalPtr(Value* V);
   Optional<LinearPtr> evalPtrImpl(Value* V);
   Optional<LinearPtr> evalPtrConstant(Constant* C);
-  Optional<LinearPtr> evalPtrConstantExpr(ConstantExpr* C);
+  Optional<LinearPtr> evalPtrInstruction(Instruction* Inst);
+  Optional<LinearPtr> evalPtrOpcode(unsigned Opcode, User* U);
 
   /// Wrapper around llvm::ConstantFoldConstant.
   Constant* constantFoldConstant(Constant* C);
   Constant* constantFoldExtra(Constant* C);
   Constant* constantFoldAlignmentCheck(Constant* C);
+
+  /// Constant fold, plus some extra cases.  Returns nullptr if it was unable
+  /// to reduce `Inst` to a constant.
+  Constant* constantFoldInstructionExtra(Instruction* Inst);
+  Constant* constantFoldNullCheckInst(Instruction* Inst);
 };
 
 
@@ -290,7 +296,7 @@ bool State::step() {
 
 
   // Try constant folding.
-  if (Constant* C = ConstantFoldInstruction(Inst, NewFunc->getParent()->getDataLayout(), TLI)) {
+  if (Constant* C = constantFoldInstructionExtra(Inst)) {
     C = constantFoldExtra(C);
     errs() << "step(constant): map " << *OldInst << " -> " << *C << "\n";
     SF.Locals[OldInst] = C;
@@ -549,6 +555,66 @@ Constant* State::constantFoldAlignmentCheck(Constant* C) {
   return ConstantInt::get(Mask->getType(), Ptr->Offset & MaskInt);
 }
 
+Constant* State::constantFoldInstructionExtra(Instruction* Inst) {
+  Constant* C = ConstantFoldInstruction(Inst, NewFunc->getParent()->getDataLayout(), TLI);
+  if (C != nullptr) {
+    return C;
+  }
+
+  C = constantFoldNullCheckInst(Inst);
+  if (C != nullptr) {
+    return C;
+  }
+
+  return nullptr;
+}
+
+/// Null checks.  We handle `ptr == NULL` by evaluating a `ptr` to a
+/// `LinearPtr` and checking if it's null.
+Constant* State::constantFoldNullCheckInst(Instruction* Inst) {
+  auto ICmp = dyn_cast<ICmpInst>(Inst);
+  if (ICmp == nullptr || !ICmp->isEquality()) {
+    return nullptr;
+  }
+
+  Value* PtrVal = nullptr;
+  Constant* NullConst;
+  if ((NullConst = dyn_cast<Constant>(ICmp->getOperand(0))) && NullConst->isNullValue()) {
+    PtrVal = ICmp->getOperand(1);
+  } else if ((NullConst = dyn_cast<Constant>(ICmp->getOperand(1))) && NullConst->isNullValue()) {
+    PtrVal = ICmp->getOperand(0);
+  } else {
+    return nullptr;
+  }
+
+  LinearPtr* Ptr = evalPtr(PtrVal);
+  if (Ptr == nullptr) {
+    return nullptr;
+  }
+  // Convert to base and offset form.  For now, we don't try to handle cases
+  // where two pointers have been added together.
+  Optional<Value*> OptBase = Ptr->getBase();
+  if (!OptBase.hasValue()) {
+    return nullptr;
+  }
+  Value* Base = OptBase.getValue();
+
+  bool PtrIsNull = Base == nullptr && Ptr->Offset == 0;
+  bool Result;
+  if (ICmp->getPredicate() == CmpInst::ICMP_EQ) {
+    Result = PtrIsNull;
+  } else {
+    assert(ICmp->getPredicate() == CmpInst::ICMP_NE);
+    Result = !PtrIsNull;
+  }
+
+  if (Result) {
+    return ConstantInt::getTrue(Inst->getContext());
+  } else {
+    return ConstantInt::getFalse(Inst->getContext());
+  }
+}
+
 LinearPtr* State::evalPtr(Value* V) {
   auto It = EvalCache.find(V);
   if (It == EvalCache.end()) {
@@ -565,6 +631,10 @@ LinearPtr* State::evalPtr(Value* V) {
 Optional<LinearPtr> State::evalPtrImpl(Value* V) {
   if (auto C = dyn_cast<Constant>(V)) {
     return evalPtrConstant(C);
+  } else if (auto Inst = dyn_cast<Instruction>(V)) {
+    return evalPtrInstruction(Inst);
+  } else if (isa<ConstantPointerNull>(V)) {
+    return LinearPtr((uint64_t)0);
   } else {
     return None;
   }
@@ -576,35 +646,39 @@ Optional<LinearPtr> State::evalPtrConstant(Constant* C) {
   } else if (auto Alias = dyn_cast<GlobalAlias>(C)) {
     return evalPtrConstant(Alias->getAliasee());
   } else if (auto Expr = dyn_cast<ConstantExpr>(C)) {
-    return evalPtrConstantExpr(Expr);
+    return evalPtrOpcode(Expr->getOpcode(), Expr);
   } else {
     return None;
   }
 }
 
-Optional<LinearPtr> State::evalPtrConstantExpr(ConstantExpr* C) {
+Optional<LinearPtr> State::evalPtrInstruction(Instruction* Inst) {
+  return evalPtrOpcode(Inst->getOpcode(), Inst);
+}
+
+Optional<LinearPtr> State::evalPtrOpcode(unsigned Opcode, User* U) {
   LinearPtr* A = nullptr;
   LinearPtr* B = nullptr;
-  switch (C->getOpcode()) {
+  switch (Opcode) {
     case Instruction::Add:
-      A = evalPtr(C->getOperand(0));
-      B = evalPtr(C->getOperand(1));
+      A = evalPtr(U->getOperand(0));
+      B = evalPtr(U->getOperand(1));
       if (A == nullptr || B == nullptr) {
         return None;
       }
       return A->add(*B);
 
     case Instruction::Sub:
-      A = evalPtr(C->getOperand(0));
-      B = evalPtr(C->getOperand(1));
+      A = evalPtr(U->getOperand(0));
+      B = evalPtr(U->getOperand(1));
       if (A == nullptr || B == nullptr) {
         return None;
       }
       return A->sub(*B);
 
     case Instruction::Mul:
-      A = evalPtr(C->getOperand(0));
-      B = evalPtr(C->getOperand(1));
+      A = evalPtr(U->getOperand(0));
+      B = evalPtr(U->getOperand(1));
       if (A == nullptr || B == nullptr) {
         return None;
       }
@@ -612,7 +686,8 @@ Optional<LinearPtr> State::evalPtrConstantExpr(ConstantExpr* C) {
 
     case Instruction::IntToPtr:
     case Instruction::PtrToInt:
-      A = evalPtr(C->getOperand(0));
+    case Instruction::BitCast:
+      A = evalPtr(U->getOperand(0));
       if (A == nullptr) {
         return None;
       }
