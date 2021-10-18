@@ -243,10 +243,10 @@ struct Memory {
   void storeConstant(MemRegion& Region, uint64_t Offset, Constant* C);
 
   /// Attempt to load a value of type `T` from `Offset` within region `Base`.
-  /// If the stored value has a different type, a cast will be created in block
-  /// `BB` and the cast result will be returned instead.  If the value is
-  /// unknown, this method returns null.
-  Value* load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB);
+  /// This method returns the stored value, which may not have type `T`, but
+  /// will always be castable to `T` with `CreateBitOrPointerCast`.  It's the
+  /// caller's responsibility to detect the type mismatch and add the cast.
+  Value* load(Value* Base, uint64_t Offset, Type* T);
   void store(Value* Base, uint64_t Offset, Value* V);
   void zero(Value* Base, uint64_t Offset, uint64_t Len);
   void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
@@ -298,7 +298,7 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
   }
 }
 
-Value* Memory::load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB) {
+Value* Memory::load(Value* Base, uint64_t Offset, Type* T) {
   uint64_t End = Offset + DL.getTypeStoreSize(T);
 
   auto& Region = getRegion(Base);
@@ -308,12 +308,8 @@ Value* Memory::load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB) {
         case OpStore:
           if (Store.Offset == Offset) {
             Type* SrcTy = Store.Val->getType();
-            if (SrcTy == T) {
+            if (SrcTy == T || CastInst::isBitOrNoopPointerCastable(SrcTy, T, DL)) {
               return Store.Val;
-            } else if (CastInst::isBitOrNoopPointerCastable(SrcTy, T, DL)) {
-              Instruction* Inst = CastInst::CreateBitOrPointerCast(Store.Val, T, "loadcast");
-              BB->getInstList().push_back(Inst);
-              return Inst;
             }
           }
           break;
@@ -494,6 +490,16 @@ struct State {
   Optional<LinearPtr> evalPtrOpcode(unsigned Opcode, User* U);
   Optional<LinearPtr> evalPtrGEP(User* U);
 
+  /// General-purpose instruction simplification and constant folding.  This
+  /// may return `Inst` itself, some other existing instruction, or a constant.
+  Value* foldInst(Instruction* Inst);
+  /// Apply `foldInst` to `Inst`, emit `Inst` into `NewBB` if needed, and
+  /// return the resulting value.  `Inst` will be deleted automatically if this
+  /// is appropriate (so `Inst` should not be used afterward - but the returned
+  /// `Value*` is guaranteed to evaluate to the same value as `Inst`).  This
+  /// method should be used when synthesizing a new instruction from scratch.
+  Value* foldAndEmitInst(Instruction* Inst);
+
   /// Wrapper around llvm::ConstantFoldConstant.
   Constant* constantFoldConstant(Constant* C);
   Constant* constantFoldExtra(Constant* C);
@@ -551,36 +557,9 @@ bool State::step() {
 
   // Try simplification and/or constant folding.
 
-  Value* Simplified = SimplifyInstruction(Inst, SQ);
-  Constant* C = nullptr;
-  if (Simplified != nullptr) {
-    if (auto SimpleConst = dyn_cast<Constant>(Simplified)) {
-      // Constants are handled below, for both simplify and constant folding.
-      C = SimpleConst;
-    } else if (auto SimpleInst = dyn_cast<Instruction>(Simplified)) {
-      // Simplify never creates an instruction; it only ever returns existing
-      // ones.
-      errs() << "step(simplify): map " << *OldInst << " -> " << *SimpleInst << "\n";
-      SF.Locals[OldInst] = SimpleInst;
-      Inst->deleteValue();
-      ++SF.Iter;
-      return true;
-    } else {
-      errs() << "bad value kind after simplify: " << *Simplified << "\n";
-      assert(0 && "bad value kind after simplify");
-    }
-  }
-
-  if (C == nullptr) {
-    if (auto FoldedConst = constantFoldInstructionExtra(Inst)) {
-      C = FoldedConst;
-    }
-  }
-
-  if (C != nullptr) {
-    C = constantFoldExtra(C);
-    errs() << "step(constant): map " << *OldInst << " -> " << *C << "\n";
-    SF.Locals[OldInst] = C;
+  Value* Folded = foldInst(Inst);
+  if (Folded != Inst) {
+    SF.Locals[OldInst] = Folded;
     Inst->deleteValue();
     ++SF.Iter;
     return true;
@@ -648,7 +627,10 @@ bool State::step() {
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
     if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
-      if (Value* V = Mem.load(Ptr->first, Ptr->second, Load->getType(), NewBB)) {
+      if (Value* V = Mem.load(Ptr->first, Ptr->second, Load->getType())) {
+        if (V->getType() != Load->getType()) {
+          V = foldAndEmitInst(CastInst::CreateBitOrPointerCast(V, Load->getType(), "loadcast"));
+        }
         SF.Locals[OldInst] = V;
         Inst->deleteValue();
         ++SF.Iter;
@@ -811,6 +793,44 @@ bool State::stepMemset(CallBase* Call) {
 
   NewBB->getInstList().push_back(Call);
   return true;
+}
+
+Value* State::foldInst(Instruction* Inst) {
+  Constant* C = nullptr;
+  Value* Simplified = SimplifyInstruction(Inst, SQ);
+  if (Simplified == nullptr) {
+    // `Inst` can't be simplified any further.  Try folding it to a constant
+    // instead.
+    C = constantFoldInstructionExtra(Inst);
+  } else if (isa<Instruction>(Simplified)) {
+    // Simplify never creates an instruction; it only ever returns existing
+    // ones.  The existing instruction was already processed by constant
+    // folding, so we know it can't be folded further.
+    return Simplified;
+  } else if (auto SimpleConst = dyn_cast<Constant>(Simplified)) {
+    // Constants are handled below, for both simplify and constant folding.
+    C = SimpleConst;
+  } else {
+    errs() << "bad value kind after simplify: " << *Simplified << "\n";
+    assert(0 && "bad value kind after simplify");
+  }
+
+  if (C != nullptr) {
+    C = constantFoldExtra(C);
+    return C;
+  }
+
+  return Inst;
+}
+
+Value* State::foldAndEmitInst(Instruction* Inst) {
+  Value* V = foldInst(Inst);
+  if (V == Inst) {
+    NewBB->getInstList().push_back(Inst);
+  } else {
+    Inst->deleteValue();
+  }
+  return V;
 }
 
 Constant* State::constantFoldConstant(Constant* C) {
