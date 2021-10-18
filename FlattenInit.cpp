@@ -412,6 +412,12 @@ struct StackFrame {
   }
 
   void enterBlock(BasicBlock* BB);
+  /// Enter `BB`, or if `BB` is null, advance to the next instruction.
+  ///
+  /// This is mostly used for call handling, where some kinds of calls are
+  /// terminators with an explicit next block, while others are ordinary
+  /// instructions.
+  void advance(BasicBlock* BB);
 
   Value* mapValue(Value* OldVal);
 };
@@ -475,6 +481,7 @@ struct State {
   /// invoke instructions, `UnwindDest` gives the landing pad (for non-invoke
   /// calls, `UnwindDest` is nullptr).
   bool stepCall(CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest);
+  bool stepMemset(CallBase* Call);
 
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
@@ -703,6 +710,14 @@ void StackFrame::enterBlock(BasicBlock* BB) {
   Iter = BB->begin();
 }
 
+void StackFrame::advance(BasicBlock* BB) {
+  if (BB == nullptr) {
+    ++Iter;
+  } else {
+    enterBlock(BB);
+  }
+}
+
 Value* StackFrame::mapValue(Value* OldVal) {
   if (isa<Constant>(OldVal)) {
     return OldVal;
@@ -724,6 +739,19 @@ bool State::stepCall(
   if (Callee == nullptr) {
     return false;
   }
+  if (Callee->isIntrinsic()) {
+    // Each of `stepFoo` functions called here (e.g. `stepMemset`) is expected
+    // to dispose of `Call` appropriately (either deleting it or adding it to
+    // `NewBB`) if it returns `true`.
+    switch (Callee->getIntrinsicID()) {
+      case Intrinsic::memset:
+        if (stepMemset(Call)) {
+          Stack.back().advance(NormalDest);
+          return true;
+        }
+        break;
+    }
+  }
   if (Callee->isVarArg()) {
     // TODO: handle vararg calls
     return false;
@@ -740,11 +768,7 @@ bool State::stepCall(
 
   // Advance the current frame past the call.
   StackFrame& SF = Stack.back();
-  if (NormalDest == nullptr) {
-    ++SF.Iter;
-  } else {
-    SF.enterBlock(NormalDest);
-  }
+  SF.advance(NormalDest);
 
   SF.ReturnValue = OldCall;
   SF.UnwindDest = UnwindDest;
@@ -758,6 +782,34 @@ bool State::stepCall(
   Stack.emplace_back(std::move(NewSF));
 
   Call->deleteValue();
+  return true;
+}
+
+bool State::stepMemset(CallBase* Call) {
+  auto DestPtr = evalBaseOffset(Call->getOperand(0));
+  if (!DestPtr) {
+    return false;
+  }
+
+  auto ValConst = dyn_cast<Constant>(Call->getOperand(1));
+  if (ValConst == nullptr) {
+    return false;
+  }
+  if (!ValConst->isZeroValue()) {
+    return false;
+  }
+
+  auto LenConst = dyn_cast<ConstantInt>(Call->getOperand(2));
+  if (LenConst == nullptr) {
+    return false;
+  }
+  uint64_t Len = LenConst->getZExtValue();
+
+  // We ignore operand 3, the `isvolatile` flag.
+
+  Mem.zero(DestPtr->first, DestPtr->second, Len);
+
+  NewBB->getInstList().push_back(Call);
   return true;
 }
 
