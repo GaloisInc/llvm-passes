@@ -136,10 +136,204 @@ struct LinearPtr {
 };
 
 
-struct MemStore {
-  uint64_t Addr;
-  Value* Val;
+enum MemStoreKind {
+  /// Store the value `Val` at this location.
+  OpStore,
+  /// Set `Len` bytes to zero, starting from `Offset`.  This represents a
+  /// `memset` call.
+  OpZero,
+  /// Set `Len` bytes to unknown values, starting from `Offset`.  `memcpy` sets
+  /// the affected range to unknown, then copies over all known values from the
+  /// source; this represents the fact that copying unknown parts of the source
+  /// writes unknown data to the dest.
+  OpUnknown,
 };
+
+struct MemStore {
+  MemStoreKind Kind;
+  uint64_t Offset;
+  union {
+    /// The value stored, for `OpStore`.
+    Value* Val;
+    /// The number of bytes affected, for `OpZero` and `OpUnknown`.
+    uint64_t Len;
+  };
+
+  static MemStore CreateStore(uint64_t Offset, Value* Val) {
+    MemStore MS = { OpStore, Offset };
+    MS.Val = Val;
+    return MS;
+  }
+
+  static MemStore CreateZero(uint64_t Offset, uint64_t Len) {
+    MemStore MS = { OpZero, Offset };
+    MS.Len = Len;
+    return MS;
+  }
+
+  static MemStore CreateUnknown(uint64_t Offset, uint64_t Len) {
+    MemStore MS = { OpUnknown, Offset };
+    MS.Len = Len;
+    return MS;
+  }
+
+  uint64_t getStoreSize(DataLayout const& DL) const {
+    switch (Kind) {
+      case OpStore:
+        return DL.getTypeStoreSize(Val->getType());
+      case OpZero:
+      case OpUnknown:
+        return Len;
+      default:
+        assert(0 && "bad mem op kind");
+        return 0;
+    }
+  }
+
+  uint64_t getEndOffset(DataLayout const& DL) const {
+    return Offset + getStoreSize(DL);
+  }
+
+  bool overlaps(MemStore const& Other, DataLayout const& DL) const {
+    return overlapsRange(Other.Offset, Other.getEndOffset(DL), DL);
+  }
+
+  bool overlapsRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
+    return Offset < End && Start < getEndOffset(DL);
+  }
+
+  bool containsRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
+    return Offset <= Start && getEndOffset(DL) <= End;
+  }
+};
+
+struct MemRegion {
+  std::vector<MemStore> Ops;
+  /// Smallest offset written within this region.
+  uint64_t MinOffset;
+  /// Largest offset (inclusive) written within this region.  We use an
+  /// inclusive range to avoid problems with wraparound.
+  uint64_t MaxOffset;
+
+  void pushOp(MemStore Op, DataLayout const& DL) {
+    uint64_t End = Op.getEndOffset(DL);
+    if (Ops.size() == 0) {
+      MinOffset = Op.Offset;
+      MaxOffset = End - 1;
+    } else {
+      if (Op.Offset < MinOffset) {
+        MinOffset = Op.Offset;
+      }
+      if (End - 1 > MaxOffset) {
+        MaxOffset = End - 1;
+      }
+    }
+    Ops.push_back(Op);
+  }
+};
+
+struct Memory {
+  DataLayout const& DL;
+  DenseMap<Value*, MemRegion> Regions;
+
+  Memory(DataLayout const& DL) : DL(DL) {}
+
+  /// Attempt to load a value of type `T` from `Offset` within region `Base`.
+  /// If the stored value has a different type, a cast will be created in block
+  /// `BB` and the cast result will be returned instead.  If the value is
+  /// unknown, this method returns null.
+  Value* load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB);
+  void store(Value* Base, uint64_t Offset, Value* V);
+  void zero(Value* Base, uint64_t Offset, uint64_t Len);
+  void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
+  void clear() {
+    Regions.clear();
+  }
+};
+
+Value* Memory::load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB) {
+  uint64_t End = Offset + DL.getTypeStoreSize(T);
+
+  auto& Region = Regions[Base];
+  for (auto& Store : make_range(Region.Ops.rbegin(), Region.Ops.rend())) {
+    if (Store.overlapsRange(Offset, End, DL)) {
+      switch (Store.Kind) {
+        case OpStore:
+          if (Store.Offset == Offset) {
+            Type* SrcTy = Store.Val->getType();
+            if (SrcTy == T) {
+              return Store.Val;
+            } else if (CastInst::isBitOrNoopPointerCastable(SrcTy, T, DL)) {
+              Instruction* Inst = CastInst::CreateBitOrPointerCast(Store.Val, T, "loadcast");
+              BB->getInstList().push_back(Inst);
+              return Inst;
+            }
+          }
+          break;
+        case OpZero:
+          if (Store.containsRange(Offset, End, DL)) {
+            return Constant::getNullValue(T);
+          }
+          break;
+        case OpUnknown:
+          break;
+      }
+
+      // `Store` overlaps this load, but we failed to obtain an appropriate
+      // value, so the result is unknown.
+      return nullptr;
+    }
+  }
+
+  // No store to this region overlaps this value.
+  return nullptr;
+}
+
+void Memory::store(Value* Base, uint64_t Offset, Value* V) {
+  uint64_t End = Offset + DL.getTypeStoreSize(V->getType());
+
+  auto& Region = Regions[Base];
+  // Look for an existing `OpStore` that we can reuse.
+  for (auto& Store : make_range(Region.Ops.rbegin(), Region.Ops.rend())) {
+    if (Store.overlapsRange(Offset, End, DL)) {
+      if (Store.Kind == OpStore && Store.Offset == Offset &&
+          Store.getStoreSize(DL) == DL.getTypeStoreSize(V->getType())) {
+        Store.Val = V;
+        return;
+      }
+
+      // `Store` overlaps the new store but can't be reused.
+      break;
+    }
+  }
+
+  Region.pushOp(MemStore::CreateStore(Offset, V), DL);
+}
+
+void Memory::zero(Value* Base, uint64_t Offset, uint64_t Len) {
+  uint64_t End = Offset + Len;
+
+  auto& Region = Regions[Base];
+  if (Region.Ops.size() > 0 && Offset <= Region.MinOffset && End - 1 >= Region.MaxOffset) {
+    // We're overwriting all data currently in the region.
+    Region.Ops.clear();
+  }
+  Region.pushOp(MemStore::CreateZero(Offset, Len), DL);
+}
+
+void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
+  uint64_t End = Offset + Len;
+
+  auto& Region = Regions[Base];
+  if (Region.Ops.size() > 0 && Offset <= Region.MinOffset && End - 1 >= Region.MaxOffset) {
+    // We're overwriting all data currently in the region.  Afterward, the
+    // entire region is unknown, so we don't need to add an explicit op.
+    Region.Ops.clear();
+    return;
+  }
+  Region.pushOp(MemStore::CreateUnknown(Offset, Len), DL);
+}
+
 
 struct StackFrame {
   Function& Func;
@@ -200,13 +394,14 @@ struct State {
   TargetLibraryInfo* TLI;
 
   DenseMap<Value*, Optional<LinearPtr>> EvalCache;
-  DenseMap<Value*, std::vector<MemStore>> Mem;
+  Memory Mem;
   std::vector<StackFrame> Stack;
 
   SimplifyQuery SQ;
 
   State(Function& OldFunc, StringRef NewName, TargetLibraryInfo* TLI)
-    : TLI(TLI), SQ(OldFunc.getParent()->getDataLayout(), TLI) {
+    : TLI(TLI), SQ(OldFunc.getParent()->getDataLayout(), TLI),
+      Mem(OldFunc.getParent()->getDataLayout()) {
     NewFunc = Function::Create(
         OldFunc.getFunctionType(),
         OldFunc.getLinkage(),
@@ -237,6 +432,7 @@ struct State {
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
 
+  Optional<std::pair<Value*, uint64_t>> evalBaseOffset(Value* V);
   LinearPtr* evalPtr(Value* V);
   Optional<LinearPtr> evalPtrImpl(Value* V);
   Optional<LinearPtr> evalPtrConstant(Constant* C);
@@ -395,6 +591,17 @@ bool State::step() {
     }
   }
 
+  if (auto Load = dyn_cast<LoadInst>(Inst)) {
+    if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
+      if (Value* V = Mem.load(Ptr->first, Ptr->second, Load->getType(), NewBB)) {
+        SF.Locals[OldInst] = V;
+        Inst->deleteValue();
+        ++SF.Iter;
+        return true;
+      }
+    }
+  }
+
 
   // We can't pass through unknown terminators, because we don't know what to
   // execute next.
@@ -409,6 +616,13 @@ bool State::step() {
   // Instructions that pass through, but with some special effect.
   if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
     EvalCache.try_emplace(Alloca, LinearPtr(Alloca));
+  } else if (auto Store = dyn_cast<StoreInst>(Inst)) {
+    if (auto Ptr = evalBaseOffset(Store->getPointerOperand())) {
+      Mem.store(Ptr->first, Ptr->second, Store->getValueOperand());
+    } else {
+      errs() << "clear mem: unknown store dest in " << *Store << "\n";
+      Mem.clear();
+    }
   } else if (auto Call = dyn_cast<CallInst>(Inst)) {
     bool IsAlloc = isAllocationFn(Call, TLI);
     bool IsFree = isFreeCall(Call, TLI);
@@ -643,6 +857,18 @@ Constant* State::constantFoldNullCheckInst(Instruction* Inst) {
   } else {
     return ConstantInt::getFalse(Inst->getContext());
   }
+}
+
+Optional<std::pair<Value*, uint64_t>> State::evalBaseOffset(Value* V) {
+  LinearPtr* LP = evalPtr(V);
+  if (LP == nullptr) {
+    return None;
+  }
+  Optional<Value*> Base = LP->getBase();
+  if (!Base.hasValue()) {
+    return None;
+  }
+  return std::make_pair(Base.getValue(), LP->Offset);
 }
 
 LinearPtr* State::evalPtr(Value* V) {
@@ -1097,6 +1323,8 @@ struct FlattenInit : public ModulePass {
         }
       }
     }
+
+    MainFunc->eraseFromParent();
 
     return true;
   }
