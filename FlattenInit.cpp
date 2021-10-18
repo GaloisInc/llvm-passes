@@ -238,6 +238,10 @@ struct Memory {
 
   Memory(DataLayout const& DL) : DL(DL) {}
 
+  MemRegion& getRegion(Value* V);
+  void initRegion(MemRegion& Region, Value* V);
+  void storeConstant(MemRegion& Region, uint64_t Offset, Constant* C);
+
   /// Attempt to load a value of type `T` from `Offset` within region `Base`.
   /// If the stored value has a different type, a cast will be created in block
   /// `BB` and the cast result will be returned instead.  If the value is
@@ -251,10 +255,38 @@ struct Memory {
   }
 };
 
+MemRegion& Memory::getRegion(Value* V) {
+  auto It = Regions.find(V);
+  if (It == Regions.end()) {
+    MemRegion Region;
+    initRegion(Region, V);
+    It = Regions.try_emplace(V, std::move(Region)).first;
+  }
+  return It->second;
+}
+
+void Memory::initRegion(MemRegion& Region, Value* V) {
+  if (auto GV = dyn_cast<GlobalVariable>(V)) {
+    if (!GV->hasInitializer()) {
+      return;
+    }
+    Constant* C = GV->getInitializer();
+    storeConstant(Region, 0, C);
+  }
+}
+
+void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
+  if (auto Null = dyn_cast<ConstantPointerNull>(C)) {
+    Region.pushOp(MemStore::CreateStore(Offset, C), DL);
+  }
+  // All other constants are unsupported for now, and initialize the region
+  // with unknown values.
+}
+
 Value* Memory::load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB) {
   uint64_t End = Offset + DL.getTypeStoreSize(T);
 
-  auto& Region = Regions[Base];
+  auto& Region = getRegion(Base);
   for (auto& Store : make_range(Region.Ops.rbegin(), Region.Ops.rend())) {
     if (Store.overlapsRange(Offset, End, DL)) {
       switch (Store.Kind) {
@@ -292,7 +324,7 @@ Value* Memory::load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB) {
 void Memory::store(Value* Base, uint64_t Offset, Value* V) {
   uint64_t End = Offset + DL.getTypeStoreSize(V->getType());
 
-  auto& Region = Regions[Base];
+  auto& Region = getRegion(Base);
   // Look for an existing `OpStore` that we can reuse.
   for (auto& Store : make_range(Region.Ops.rbegin(), Region.Ops.rend())) {
     if (Store.overlapsRange(Offset, End, DL)) {
@@ -313,7 +345,7 @@ void Memory::store(Value* Base, uint64_t Offset, Value* V) {
 void Memory::zero(Value* Base, uint64_t Offset, uint64_t Len) {
   uint64_t End = Offset + Len;
 
-  auto& Region = Regions[Base];
+  auto& Region = getRegion(Base);
   if (Region.Ops.size() > 0 && Offset <= Region.MinOffset && End - 1 >= Region.MaxOffset) {
     // We're overwriting all data currently in the region.
     Region.Ops.clear();
@@ -324,7 +356,7 @@ void Memory::zero(Value* Base, uint64_t Offset, uint64_t Len) {
 void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
   uint64_t End = Offset + Len;
 
-  auto& Region = Regions[Base];
+  auto& Region = getRegion(Base);
   if (Region.Ops.size() > 0 && Offset <= Region.MinOffset && End - 1 >= Region.MaxOffset) {
     // We're overwriting all data currently in the region.  Afterward, the
     // entire region is unknown, so we don't need to add an explicit op.
