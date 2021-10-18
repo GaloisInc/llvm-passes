@@ -276,11 +276,26 @@ void Memory::initRegion(MemRegion& Region, Value* V) {
 }
 
 void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
-  if (auto Null = dyn_cast<ConstantPointerNull>(C)) {
+  if (auto Array = dyn_cast<ConstantArray>(C)) {
+    Type* ElemTy = Array->getType()->getElementType();
+    uint64_t Stride = DL.getTypeAllocSize(ElemTy);
+    for (unsigned I = 0; I < Array->getNumOperands(); ++I) {
+      storeConstant(Region, Offset + I * Stride, Array->getOperand(I));
+    }
+  } else if (auto Struct = dyn_cast<ConstantStruct>(C)) {
+    const StructLayout* Layout = DL.getStructLayout(Struct->getType());
+    for (unsigned I = 0; I < Struct->getNumOperands(); ++I) {
+      uint64_t FieldOffset = Offset + Layout->getElementOffset(I);
+      storeConstant(Region, FieldOffset, Struct->getOperand(I));
+    }
+  } else if (C->getType()->isIntOrPtrTy() || C->getType()->isFloatingPointTy()) {
+    // Primitive values can be stored directly.
     Region.pushOp(MemStore::CreateStore(Offset, C), DL);
+  } else {
+    // All other constants are unsupported for now, and initialize the region
+    // with unknown values.
+    errs() << "don't know how to store constant " << *C << "\n";
   }
-  // All other constants are unsupported for now, and initialize the region
-  // with unknown values.
 }
 
 Value* Memory::load(Value* Base, uint64_t Offset, Type* T, BasicBlock* BB) {
