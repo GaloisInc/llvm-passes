@@ -1128,6 +1128,11 @@ struct UnwindFrameState {
   /// possible successors.
   std::vector<std::pair<BasicBlock*, BasicBlock*>> AllPreds;
 
+  /// Map from old phi nodes to corresponding new ones.  We can't use
+  /// `SF.Locals` for this because some old phi nodes are mapped to trampoline
+  /// block phi nodes in that map.
+  DenseMap<PHINode*, PHINode*> PHINodeMap;
+
   /// Trampolines used for exiting partial blocks.  Partial blocks need special
   /// handling because a separate full clone of the block might also exist if
   /// the original block is inside a loop.  We handle this by splitting the
@@ -1195,6 +1200,7 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     PHINode* NewPHI = PHINode::Create(
         PHI->getType(), PHI->getNumIncomingValues(), PHI->getName(), Out);
     SF.Locals[PHI] = NewPHI;
+    PHINodeMap[PHI] = NewPHI;
     return;
   }
 
@@ -1362,7 +1368,8 @@ void UnwindFrameState::handlePHINodes() {
     for (unsigned I = 0; I < Term->getNumSuccessors(); ++I) {
       BasicBlock* OldSucc = Term->getSuccessor(I);
       for (PHINode& OldPHI : OldSucc->phis()) {
-        PHINode* NewPHI = cast<PHINode>(mapValue(&OldPHI));
+        PHINode* NewPHI = PHINodeMap[&OldPHI];
+        assert(NewPHI != nullptr && "missing entry for phi node in PHINodeMap");
         Value* OldVal = OldPHI.getIncomingValueForBlock(OldPred);
         Value* NewVal = mapValue(OldVal);
         NewPHI->addIncoming(NewVal, NewPred);
