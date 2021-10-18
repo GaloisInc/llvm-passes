@@ -203,7 +203,7 @@ struct MemStore {
   }
 
   bool containsRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
-    return Offset <= Start && getEndOffset(DL) <= End;
+    return Offset <= Start && End <= getEndOffset(DL);
   }
 };
 
