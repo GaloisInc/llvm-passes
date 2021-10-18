@@ -470,6 +470,7 @@ struct State {
   Optional<LinearPtr> evalPtrConstant(Constant* C);
   Optional<LinearPtr> evalPtrInstruction(Instruction* Inst);
   Optional<LinearPtr> evalPtrOpcode(unsigned Opcode, User* U);
+  Optional<LinearPtr> evalPtrGEP(User* U);
 
   /// Wrapper around llvm::ConstantFoldConstant.
   Constant* constantFoldConstant(Constant* C);
@@ -981,9 +982,59 @@ Optional<LinearPtr> State::evalPtrOpcode(unsigned Opcode, User* U) {
       }
       return *A;
 
+    case Instruction::GetElementPtr:
+      return std::move(evalPtrGEP(U));
+
     default:
       return None;
   }
+}
+
+Optional<LinearPtr> State::evalPtrGEP(User* U) {
+  // Get the pointee type for the base of the GEP.  Note the cast can fail,
+  // since GEP works on vectors of pointers as well as ordinary pointers.
+  auto BasePtrTy = dyn_cast<PointerType>(U->getOperand(0)->getType());
+  if (BasePtrTy == nullptr) {
+    return None;
+  }
+  Type* BaseTy = BasePtrTy->getElementType();
+
+  // Get the base pointer as a `LinearPtr`.
+  LinearPtr* BaseLP = evalPtr(U->getOperand(0));
+  if (BaseLP == nullptr) {
+    return None;
+  }
+  LinearPtr Result = *BaseLP;
+
+  DataLayout const& DL = NewFunc->getParent()->getDataLayout();
+
+  // Apply the first offset, which does pointer arithmeon to the base pointer.
+  auto Idx0 = dyn_cast<ConstantInt>(U->getOperand(1));
+  if (Idx0 == nullptr) {
+    return None;
+  }
+  Result.Offset += DL.getTypeAllocSize(BaseTy) * Idx0->getSExtValue();
+
+  Type* CurTy = BaseTy;
+  for (unsigned I = 2; I < U->getNumOperands(); ++I) {
+    auto Idx = dyn_cast<ConstantInt>(U->getOperand(I));
+    if (Idx == nullptr) {
+      return None;
+    }
+    int64_t IdxVal = Idx->getSExtValue();
+
+    if (auto StructTy = dyn_cast<StructType>(CurTy)) {
+      Result.Offset += DL.getStructLayout(StructTy)->getElementOffset(IdxVal);
+      CurTy = StructTy->getElementType(IdxVal);
+    } else if (auto ArrayTy = dyn_cast<ArrayType>(CurTy)) {
+      Result.Offset += DL.getTypeAllocSize(ArrayTy->getElementType()) * IdxVal;
+      CurTy = ArrayTy->getElementType();
+    } else {
+      return None;
+    }
+  }
+
+  return std::move(Result);
 }
 
 
