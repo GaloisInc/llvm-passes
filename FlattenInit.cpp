@@ -625,6 +625,13 @@ bool State::step() {
       }
     }
   }
+  if (auto Switch = dyn_cast<SwitchInst>(Inst)) {
+    if (auto ConstCond = dyn_cast<ConstantInt>(Switch->getCondition())) {
+      SF.enterBlock(Switch->findCaseValue(ConstCond)->getCaseSuccessor());
+      Inst->deleteValue();
+      return true;
+    }
+  }
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
     if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
