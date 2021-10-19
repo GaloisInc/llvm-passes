@@ -724,10 +724,17 @@ bool State::step() {
       Mem.store(Ptr->first, Ptr->second, Store->getValueOperand());
     } else {
       errs() << "clear mem: unknown store dest in " << *Store << "\n";
-      Mem.clear();
+      //Mem.clear();
+      errs() << "unwinding due to (old) " << *OldInst << "\n";
+      errs() << "unwinding due to (new) " << *Inst << "\n";
+      Inst->deleteValue();
+      return false;
     }
   } else {
-    // TODO: for unknown instructions with Inst->mayWriteToMemory(), clear all known memory
+    errs() << "would unwind due to (old) " << *OldInst << "\n";
+    errs() << "would unwind due to (new) " << *Inst << "\n";
+    //Inst->deleteValue();
+    //return false;
   }
 
   SF.Locals[OldInst] = Inst;
