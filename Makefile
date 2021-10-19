@@ -9,8 +9,8 @@ OBJS = \
 			 FlattenInit.o
 
 passes.so: $(OBJS)
-	$(CXX) -ggdb -fPIC -shared -o $@ $^ `$(LLVM_CONFIG) --ldflags`
+	$(CXX) $(CXXFLAGS) -ggdb -fPIC -shared -o $@ $^ `$(LLVM_CONFIG) --ldflags`
 
 %.o: %.cpp
-	$(CXX) -ggdb -fPIC -fno-rtti -fno-exceptions -c -o $@ $< `$(LLVM_CONFIG) --cxxflags`
+	$(CXX) $(CXXFLAGS) -ggdb -fPIC -fno-rtti -fno-exceptions -c -o $@ $< `$(LLVM_CONFIG) --cxxflags`
 
