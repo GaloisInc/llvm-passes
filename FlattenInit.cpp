@@ -288,6 +288,9 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
       uint64_t FieldOffset = Offset + Layout->getElementOffset(I);
       storeConstant(Region, FieldOffset, Struct->getOperand(I));
     }
+  } else if (auto AggZero = dyn_cast<ConstantAggregateZero>(C)) {
+    uint64_t Len = DL.getTypeStoreSize(AggZero->getType());
+    Region.pushOp(MemStore::CreateZero(Offset, Len), DL);
   } else if (C->getType()->isIntOrPtrTy() || C->getType()->isFloatingPointTy()) {
     // Primitive values can be stored directly.
     Region.pushOp(MemStore::CreateStore(Offset, C), DL);
