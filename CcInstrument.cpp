@@ -73,6 +73,9 @@ struct CcInstrument : public FunctionPass {
 
     CallInst::Create(fty_trace, func_trace, trace_args, "", first_inst);
 
+    // Adjust attributes to reflect that the function has side effects.
+    F.removeFnAttr(Attribute::ReadNone);
+
     return true;
   }
 }; // end of struct CcInstrument
