@@ -556,12 +556,15 @@ struct State {
   /// Wrapper around llvm::ConstantFoldConstant.
   Constant* constantFoldConstant(Constant* C);
   Constant* constantFoldExtra(Constant* C);
-  Constant* constantFoldAlignmentCheck(Constant* C);
+  Constant* constantFoldAlignmentCheckAnd(Constant* C);
+  Constant* constantFoldAlignmentCheckURem(Constant* C);
+  Constant* constantFoldAlignmentCheckPtr(Constant* C, LinearPtr* LP, uint64_t Align);
 
   /// Constant fold, plus some extra cases.  Returns nullptr if it was unable
   /// to reduce `Inst` to a constant.
   Constant* constantFoldInstructionExtra(Instruction* Inst);
   Constant* constantFoldNullCheckInst(Instruction* Inst);
+  Constant* constantFoldPointerCompare(Instruction* Inst);
 };
 
 
@@ -1036,7 +1039,8 @@ Constant* State::constantFoldConstant(Constant* C) {
 
 /// Apply extra constant folding for certain special cases.
 Constant* State::constantFoldExtra(Constant* C) {
-  C = constantFoldAlignmentCheck(C);
+  C = constantFoldAlignmentCheckAnd(C);
+  C = constantFoldAlignmentCheckURem(C);
   C = constantFoldConstant(C);
   return C;
 }
@@ -1044,7 +1048,7 @@ Constant* State::constantFoldExtra(Constant* C) {
 /// Fold alignment checks, like `(uintptr_t)ptr & 7`.  These appear in
 /// functions like `memcpy` and `strcmp`.  We handle these by increasing the
 /// alignment of the declaration of `ptr` so the result has a known value.
-Constant* State::constantFoldAlignmentCheck(Constant* C) {
+Constant* State::constantFoldAlignmentCheckAnd(Constant* C) {
   auto And = dyn_cast<ConstantExpr>(C);
   if (And == nullptr || And->getOpcode() != Instruction::And) {
     return C;
@@ -1080,32 +1084,65 @@ Constant* State::constantFoldAlignmentCheck(Constant* C) {
     return constantFoldExtra(ConstantExpr::getOr(C0, C1));
   }
 
-  // Evaluate `Val` as a base and offset pair.
+  // Evaluate `Val` as a pointer expression.
   LinearPtr* Ptr = evalPtr(Val);
   if (Ptr == nullptr) {
     return C;
   }
-  Optional<Value*> OptBase = Ptr->getBase();
-  if (!OptBase.hasValue()) {
-    return C;
-  }
-  Value* Base = OptBase.getValue();
+  return constantFoldAlignmentCheckPtr(C, Ptr, Align);
+}
 
-  // If the base is a global variable or function, adjust its alignment to at
-  // least `Align`.
-  auto Global = dyn_cast<GlobalObject>(Base);
-  if (Global == nullptr) {
+Constant* State::constantFoldAlignmentCheckURem(Constant* C) {
+  auto URem = dyn_cast<ConstantExpr>(C);
+  if (URem == nullptr || URem->getOpcode() != Instruction::URem) {
     return C;
   }
 
-  unsigned OldAlign = Global->getAlignment();
-  if (OldAlign < Align) {
-    Global->setAlignment(Align);
+  errs() << "looking at urem: " << *C << "\n";
+
+  Constant* Val = URem->getOperand(0);;
+  ConstantInt* AlignConst = dyn_cast<ConstantInt>(URem->getOperand(1));
+  if (AlignConst == nullptr) {
+    return C;
   }
 
-  // We know `base & mask` is zero, so the result of `(base + offset) & mask`
-  // is just `offset & mask`.
-  return ConstantInt::get(Mask->getType(), Ptr->Offset & MaskInt);
+  if (AlignConst->uge(4096 + 1)) {
+    return C;
+  }
+  uint64_t Align = AlignConst->getZExtValue();
+  // Check if Align is a power of two.
+  if ((Align & (Align - 1)) != 0) {
+    return C;
+  }
+
+  // Evaluate `Val` as a pointer expression.
+  LinearPtr* Ptr = evalPtr(Val);
+  if (Ptr == nullptr) {
+    errs() << "failed to evaluate to a pointer: " << *Val << "\n";
+    return C;
+  }
+  return constantFoldAlignmentCheckPtr(C, Ptr, Align);
+}
+
+Constant* State::constantFoldAlignmentCheckPtr(Constant* C, LinearPtr* LP, uint64_t Align) {
+  for (auto& Term : LP->Terms) {
+    // If the base is a global variable or function, adjust its alignment to at
+    // least `Align`.
+    auto Global = dyn_cast<GlobalObject>(Term.Ptr);
+    if (Global == nullptr) {
+      return C;
+    }
+
+    unsigned OldAlign = Global->getAlignment();
+    if (OldAlign < Align) {
+      Global->setAlignment(Align);
+    }
+  }
+
+  // Each term's base pointer is now equal to zero mod `Align`, so the sum of
+  // all terms is also equal to zero mod `Align`.  The overall result is now
+  // equal to `LP->Offset % Align`.
+  return ConstantInt::get(C->getType(), LP->Offset & (Align - 1));
 }
 
 Constant* State::constantFoldInstructionExtra(Instruction* Inst) {
@@ -1115,6 +1152,11 @@ Constant* State::constantFoldInstructionExtra(Instruction* Inst) {
   }
 
   C = constantFoldNullCheckInst(Inst);
+  if (C != nullptr) {
+    return C;
+  }
+
+  C = constantFoldPointerCompare(Inst);
   if (C != nullptr) {
     return C;
   }
@@ -1168,6 +1210,30 @@ Constant* State::constantFoldNullCheckInst(Instruction* Inst) {
   }
 }
 
+Constant* State::constantFoldPointerCompare(Instruction* Inst) {
+  auto ICmp = dyn_cast<ICmpInst>(Inst);
+  if (ICmp == nullptr || !ICmp->isEquality()) {
+    return nullptr;
+  }
+
+  auto Ptr1 = evalBaseOffset(ICmp->getOperand(0));
+  if (!Ptr1) {
+    return nullptr;
+  }
+  auto Ptr2 = evalBaseOffset(ICmp->getOperand(1));
+  if (!Ptr2) {
+    return nullptr;
+  }
+
+  // Two pointers are equal if they have the same base and the same offset.
+  bool Result = Ptr1->first == Ptr2->first && Ptr1->second == Ptr2->second;
+  if (Result) {
+    return ConstantInt::getTrue(Inst->getContext());
+  } else {
+    return ConstantInt::getFalse(Inst->getContext());
+  }
+}
+
 Optional<std::pair<Value*, uint64_t>> State::evalBaseOffset(Value* V) {
   LinearPtr* LP = evalPtr(V);
   if (LP == nullptr) {
@@ -1212,6 +1278,12 @@ Optional<LinearPtr> State::evalPtrConstant(Constant* C) {
     return evalPtrConstant(Alias->getAliasee());
   } else if (auto Expr = dyn_cast<ConstantExpr>(C)) {
     return evalPtrOpcode(Expr->getOpcode(), Expr);
+  } else if (auto Int = dyn_cast<ConstantInt>(C)) {
+    if (Int->getBitWidth() > 64) {
+      // Don't convert if it will cause us to lose data.
+      return None;
+    }
+    return LinearPtr(Int->getZExtValue());
   } else {
     return None;
   }
