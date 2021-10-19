@@ -883,10 +883,6 @@ bool State::stepCall(
     }
   }
 
-  if (Callee->isVarArg() || CallSig->isVarArg()) {
-    // TODO: handle vararg calls
-    return false;
-  }
   if (Callee->isDeclaration()) {
     // Function body is not available.
     return false;
@@ -896,12 +892,12 @@ bool State::stepCall(
     // The callee has been bitcasted to another signature.  Check for
     // compatibility.
     FunctionType* DefSig = Callee->getFunctionType();
-    if (CallSig->getNumParams() < DefSig->getNumParams()) {
+    if (Call->arg_size() < DefSig->getNumParams()) {
       // Calling with too few arguments is not supported.
       return false;
     }
     for (unsigned I = 0; I < DefSig->getNumParams(); ++I) {
-      Type* CallTy = CallSig->getParamType(I);
+      Type* CallTy = Call->getArgOperand(I)->getType();
       Type* DefTy = DefSig->getParamType(I);
       if (CallTy != DefTy && !CastInst::isBitOrNoopPointerCastable(CallTy, DefTy, DL)) {
         // Argument types are not convertible.
@@ -909,8 +905,8 @@ bool State::stepCall(
       }
     }
 
-    Type* CallReturnTy = CallSig->getReturnType();
-    Type* DefReturnTy = CallSig->getReturnType();
+    Type* CallReturnTy = Call->getType();
+    Type* DefReturnTy = DefSig->getReturnType();
     if (CallReturnTy != DefReturnTy && !CallReturnTy->isVoidTy() &&
         !CastInst::isBitOrNoopPointerCastable(DefReturnTy, CallReturnTy, DL)) {
       // Return type is non-void and not convertible.
@@ -923,8 +919,8 @@ bool State::stepCall(
   SF.advance(NormalDest);
 
   SF.ReturnValue = OldCall;
-  if (Callee->getFunctionType()->getReturnType() != CallSig->getReturnType()) {
-    SF.CastReturnType = CallSig->getReturnType();
+  if (Callee->getFunctionType()->getReturnType() != Call->getType()) {
+    SF.CastReturnType = Call->getType();
   }
   SF.UnwindDest = UnwindDest;
 
