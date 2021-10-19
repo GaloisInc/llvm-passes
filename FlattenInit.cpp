@@ -1,4 +1,5 @@
 #include "llvm/Pass.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
@@ -260,8 +261,6 @@ struct Memory {
   void store(Value* Base, uint64_t Offset, Value* V);
   void zero(Value* Base, uint64_t Offset, uint64_t Len);
   void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
-  void copy(Value* DestBase, uint64_t DestOffset,
-      Value* SrcBase, uint64_t SrcOffset, uint64_t Len);
   void clear() {
     Regions.clear();
   }
@@ -404,42 +403,6 @@ void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
   Region.pushOp(MemStore::CreateUnknown(Offset, Len), DL);
 }
 
-void Memory::copy(Value* DestBase, uint64_t DestOffset,
-    Value* SrcBase, uint64_t SrcOffset, uint64_t Len) {
-  errs() << "copy: dest " << *DestBase << " +" << DestOffset <<
-    ", src " << *SrcBase << " +" << SrcOffset <<
-    ", length " << Len << "\n";
-  assert(SrcBase != DestBase && "copy within a single region is NYI");
-
-  setUnknown(DestBase, DestOffset, Len);
-
-  auto& DestRegion = getRegion(DestBase);
-  auto& SrcRegion = getRegion(SrcBase);
-  uint64_t SrcEnd = SrcOffset + Len;
-  for (auto& Store : SrcRegion.Ops) {
-    if (Store.containedByRange(SrcOffset, SrcEnd, DL)) {
-      MemStore NewStore = Store;
-      NewStore.Offset = Store.Offset - SrcOffset + DestOffset;
-      DestRegion.pushOp(std::move(NewStore), DL);
-    } else if (Store.overlapsRange(SrcOffset, SrcEnd, DL)) {
-      if (Store.Kind == OpZero || Store.Kind == OpUnknown) {
-        uint64_t Start = std::max(SrcOffset, Store.Offset);
-        uint64_t End = std::min(SrcEnd, Store.getEndOffset(DL));
-
-        MemStore NewStore = Store;
-        NewStore.Offset = Start - SrcOffset + DestOffset;
-        NewStore.Len = End - Start;
-        DestRegion.pushOp(std::move(NewStore), DL);
-      } else {
-        errs() << "copy partially failed: store at " << Store.Offset <<
-            " only partially overlaps source region " << SrcOffset << " .. " << SrcEnd <<
-            ", when copying from " << *SrcBase << " +" << SrcOffset <<
-            " to " << *DestBase << " +" << DestOffset << "\n";
-      }
-    }
-  }
-}
-
 
 struct StackFrame {
   Function& Func;
@@ -551,13 +514,19 @@ struct State {
   bool stepFree(CallBase* Call, CallBase* OldCall);
   Value* stepAlloca(AllocaInst* Alloca);
 
-  // Try to convert the result of `Memory::load` to a value of type `T`.
-  // Returns null if the conversion isn't possible.
-  Value* convertLoadResult(Value* V, uint64_t Offset, Type* T);
   // Allocate a new `GlobalVariable` containing an array.  This is a helper
   // function for `stepMalloc` and such.
   std::pair<GlobalVariable*, Constant*> allocateGlobal(
       Type* ElemTy, uint64_t Count, uint64_t Align, bool Zero);
+
+  /// Load a single byte from memory.  Returns `nullptr` if the value of the
+  /// byte is unknown.
+  Value* memLoadByte(Value* Base, uint64_t Offset);
+  void memCopy(Value* DestBase, uint64_t DestOffset,
+      Value* SrcBase, uint64_t SrcOffset, uint64_t Len);
+  // Try to convert the result of `Memory::load` to a value of type `T`.
+  // Returns null if the conversion isn't possible.
+  Value* convertLoadResult(Value* V, uint64_t Offset, Type* T);
 
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
@@ -1011,7 +980,7 @@ bool State::stepMemcpy(CallBase* Call) {
     errs() << "memcpy failed: copy within a single region is NYI, in " << *SrcPtr->first << "\n";
   }
 
-  Mem.copy(DestPtr->first, DestPtr->second, SrcPtr->first, SrcPtr->second, Len);
+  memCopy(DestPtr->first, DestPtr->second, SrcPtr->first, SrcPtr->second, Len);
 
   NewBB->getInstList().push_back(Call);
   return true;
@@ -1227,7 +1196,7 @@ bool State::stepRealloc(CallBase* Call, CallBase* OldCall) {
   // is the base, not `Ptr` itself.
   EvalCache[GV] = LinearPtr(GV);
   if (MemcpySize != 0) {
-    Mem.copy(GV, 0, OldPtr->first, 0, MemcpySize);
+    memCopy(GV, 0, OldPtr->first, 0, MemcpySize);
 
     // Emit a call to `memcpy` to initialize the new global from the old.
     Type* SizeTy = IntegerType::get(NewFunc->getContext(), 64);
@@ -1290,6 +1259,88 @@ Value* State::stepAlloca(AllocaInst* Alloca) {
 
   EvalCache[GV] = LinearPtr(GV);
   return Ptr;
+}
+
+Value* State::memLoadByte(Value* Base, uint64_t Offset) {
+  Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
+  auto Result = Mem.load(Base, Offset, ByteTy);
+  if (Result.first == nullptr) {
+    return nullptr;
+  }
+  return convertLoadResult(Result.first, Result.second, ByteTy);
+}
+
+void State::memCopy(Value* DestBase, uint64_t DestOffset,
+    Value* SrcBase, uint64_t SrcOffset, uint64_t Len) {
+  assert(SrcBase != DestBase && "copy within a single region is NYI");
+
+  Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
+
+  Mem.setUnknown(DestBase, DestOffset, Len);
+
+  auto& DestRegion = Mem.getRegion(DestBase);
+  auto& SrcRegion = Mem.getRegion(SrcBase);
+  uint64_t SrcEnd = SrcOffset + Len;
+  BitVector Written(Len);
+  for (auto& Store : make_range(SrcRegion.Ops.rbegin(), SrcRegion.Ops.rend())) {
+    if (!Store.overlapsRange(SrcOffset, SrcEnd, DL)) {
+      continue;
+    }
+
+    // Compute the affected portion, relative to the copied region.
+    uint64_t StoreEnd = Store.getEndOffset(DL);
+    uint64_t AffectedOffset = std::max(Store.Offset, SrcOffset);
+    uint64_t AffectedEnd = std::min(StoreEnd, SrcEnd);
+    if (AffectedOffset >= AffectedEnd) {
+      continue;
+    }
+
+    uint64_t RelOffset = AffectedOffset - SrcOffset;
+    uint64_t RelEnd = AffectedEnd - SrcOffset;
+
+    if (Store.Kind == OpZero || Store.Kind == OpUnknown) {
+      // Apply the same operation to every unwritten portion of `RelOffset ..
+      // RelEnd`.
+      int StartBit = Written.find_first_unset_in(RelOffset, RelEnd);
+      while (StartBit != -1) {
+        int EndBit = Written.find_first_in(StartBit, RelEnd);
+        if (EndBit == -1) {
+          EndBit = RelEnd;
+        }
+        MemStore NewStore = Store;
+        NewStore.Offset = DestOffset + StartBit;
+        NewStore.Len = EndBit - StartBit;
+        DestRegion.pushOp(std::move(NewStore), DL);
+        Written.set(StartBit, EndBit);
+
+        StartBit = Written.find_first_unset_in(EndBit, RelEnd);
+      }
+    } else {
+      assert(Store.Kind == OpStore);
+      if (Store.containedByRange(SrcOffset, SrcEnd, DL) &&
+          Written.find_first_in(RelOffset, RelEnd) == -1) {
+        // The entire `Store` is in-range and not yet written.  We can copy it
+        // directly into `DestRegion`.
+        MemStore NewStore = Store;
+        NewStore.Offset = DestOffset + RelOffset;
+        DestRegion.pushOp(std::move(NewStore), DL);
+        Written.set(RelOffset, RelEnd);
+      } else {
+        // Chop the stored value into bytes, and copy them one at a time.
+        for (uint64_t I = RelOffset; I < RelEnd; ++I) {
+          if (Written[I]) {
+            continue;
+          }
+
+          uint64_t ByteOffset = I + SrcOffset - Store.Offset;
+          Value* Byte = convertLoadResult(Store.Val, ByteOffset, ByteTy);
+          MemStore NewStore = MemStore::CreateStore(DestOffset + I, Byte);
+          DestRegion.pushOp(std::move(NewStore), DL);
+          Written.set(I);
+        }
+      }
+    }
+  }
 }
 
 Value* State::foldInst(Instruction* Inst) {
