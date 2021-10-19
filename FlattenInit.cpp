@@ -308,6 +308,8 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
   } else if (C->getType()->isIntOrPtrTy() || C->getType()->isFloatingPointTy()) {
     // Primitive values can be stored directly.
     Region.pushOp(MemStore::CreateStore(Offset, C), DL);
+  } else if (isa<UndefValue>(C)) {
+    // Do nothing - there are no defined values to store.
   } else {
     // All other constants are unsupported for now, and initialize the region
     // with unknown values.
@@ -527,10 +529,18 @@ struct State {
   bool stepCall(CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest);
   bool stepMemset(CallBase* Call);
   bool stepMemcpy(CallBase* Call);
+  bool stepMalloc(CallBase* Call, CallBase* OldCall);
+  bool stepRealloc(CallBase* Call, CallBase* OldCall);
+  bool stepFree(CallBase* Call, CallBase* OldCall);
+  Value* stepAlloca(AllocaInst* Alloca);
 
   // Try to convert the result of `Memory::load` to a value of type `T`.
   // Returns null if the conversion isn't possible.
   Value* convertLoadResult(Value* V, uint64_t Offset, Type* T);
+  // Allocate a new `GlobalVariable` containing an array.  This is a helper
+  // function for `stepMalloc` and such.
+  std::pair<GlobalVariable*, Constant*> allocateGlobal(
+      Type* ElemTy, uint64_t Count, uint64_t Align, bool Zero);
 
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
@@ -708,6 +718,17 @@ bool State::step() {
   }
 
 
+  // Allocation instructions.
+  if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
+    if (Value* V = stepAlloca(Alloca)) {
+      SF.Locals[OldInst] = V;
+      Inst->deleteValue();
+      ++SF.Iter;
+      return true;
+    }
+  }
+
+
   // We can't pass through unknown terminators, because we don't know what to
   // execute next.
   if (Inst->isTerminator()) {
@@ -719,39 +740,12 @@ bool State::step() {
 
 
   // Instructions that pass through, but with some special effect.
-  if (auto Alloca = dyn_cast<AllocaInst>(Inst)) {
-    EvalCache.try_emplace(Alloca, LinearPtr(Alloca));
-  } else if (auto Store = dyn_cast<StoreInst>(Inst)) {
+  if (auto Store = dyn_cast<StoreInst>(Inst)) {
     if (auto Ptr = evalBaseOffset(Store->getPointerOperand())) {
       Mem.store(Ptr->first, Ptr->second, Store->getValueOperand());
     } else {
       errs() << "clear mem: unknown store dest in " << *Store << "\n";
       Mem.clear();
-    }
-  } else if (auto Call = dyn_cast<CallInst>(Inst)) {
-    bool IsAlloc = isAllocationFn(Call, TLI);
-    bool IsFree = isFreeCall(Call, TLI);
-    if (IsAlloc || IsFree) {
-      if (IsAlloc) {
-        if (isReallocLikeFn(Call, TLI)) {
-          if (auto Ptr = evalBaseOffset(Call->getOperand(0))) {
-            Value* Base = Ptr->first;
-            uint64_t Offset = Ptr->second;
-            if (Offset == 0) {
-              if (Base == nullptr) {
-                // `realloc(NULL, sz)` works like `malloc(sz)`.
-                EvalCache.try_emplace(Call, LinearPtr(Call));
-              } else {
-                // `realloc(ptr, sz)` returns a pointer with the same contents
-                // as `ptr`.
-                EvalCache.try_emplace(Call, LinearPtr(Base));
-              }
-            }
-          }
-        } else {
-          EvalCache.try_emplace(Call, LinearPtr(Call));
-        }
-      }
     }
   } else {
     // TODO: for unknown instructions with Inst->mayWriteToMemory(), clear all known memory
@@ -840,9 +834,27 @@ Function* getCallee(Value* V) {
 
 bool State::stepCall(
     CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest) {
-  if (isAllocationFn(Call, TLI) || isFreeCall(Call, TLI)) {
-    // Never step into malloc or free functions.  They get special handling in
-    // `step` instead.
+  // Never step into malloc or free functions.  If the special handler fails to
+  // handle it, bail out.
+  if (isReallocLikeFn(Call, TLI)) {
+    if (stepRealloc(Call, OldCall)) {
+      Stack.back().advance(NormalDest);
+      return true;
+    }
+    return false;
+  }
+  if (isAllocationFn(Call, TLI)) {
+    if (stepMalloc(Call, OldCall)) {
+      Stack.back().advance(NormalDest);
+      return true;
+    }
+    return false;
+  }
+  if (isFreeCall(Call, TLI)) {
+    if (stepFree(Call, OldCall)) {
+      Stack.back().advance(NormalDest);
+      return true;
+    }
     return false;
   }
 
@@ -988,6 +1000,281 @@ bool State::stepMemcpy(CallBase* Call) {
 
   NewBB->getInstList().push_back(Call);
   return true;
+}
+
+std::pair<GlobalVariable*, Constant*> State::allocateGlobal(
+    Type* ElemTy, uint64_t Count, uint64_t Align, bool Zero) {
+  Type* Ty = ArrayType::get(ElemTy, Count);
+  Constant* Init;
+  if (Zero) {
+    Init = ConstantAggregateZero::get(Ty);
+  } else {
+    Init = UndefValue::get(Ty);
+  }
+  GlobalVariable* GV = new GlobalVariable(
+      *NewFunc->getParent(),
+      Ty,
+      false,  // not constant
+      GlobalValue::InternalLinkage,
+      Init,
+      "alloc");
+  GV->setAlignment(Align);
+  Constant* GEPIdxs[2] = {
+    ConstantInt::get(IntegerType::get(NewFunc->getContext(), 64), 0),
+    ConstantInt::get(IntegerType::get(NewFunc->getContext(), 32), 0),
+  };
+  Constant* Ptr = ConstantExpr::getInBoundsGetElementPtr(Ty, GV, GEPIdxs);
+  return std::make_pair(GV, Ptr);
+}
+
+bool State::stepMalloc(CallBase* Call, CallBase* OldCall) {
+  Function* Callee = Call->getCalledFunction();
+  if (Callee == nullptr) {
+    return false;
+  }
+  LibFunc LF;
+  if (!TLI->getLibFunc(*Callee, LF)) {
+    return false;
+  }
+
+  // The size of the allocated region.  This is always set.
+  Value* SizeV;
+  // If set, the size of the allocated region is the product of `Size` and
+  // `Size2`, instead of just `Size`.
+  Value* Size2V = nullptr;
+  // If set, the allocated region is aligned to a multiple of this amount.
+  Value* AlignV = nullptr;
+  // If set, the allocated region is zeroed.
+  bool Zero = false;
+  // Out-pointer argument.  If set, the function stores the allocated pointer
+  // here and returns zero, instead of returning the pointer directly.
+  Value* OutPtrV = nullptr;
+
+  switch (LF) {
+    case LibFunc_malloc:
+      SizeV = Call->getOperand(0);
+      break;
+    case LibFunc_calloc:
+      SizeV = Call->getOperand(0);
+      Size2V = Call->getOperand(1);
+      Zero = true;
+      break;
+    case LibFunc_posix_memalign:
+      OutPtrV = Call->getOperand(0);
+      AlignV = Call->getOperand(1);
+      SizeV = Call->getOperand(2);
+      break;
+    default:
+      errs() << "failed to handle malloc: unsupported callee in " << *Call << "\n";
+      return false;
+  }
+
+  // Convert the arguments.
+  uint64_t Size;
+  if (auto Int = dyn_cast<ConstantInt>(SizeV)) {
+    Size = Int->getZExtValue();
+  } else {
+    errs() << "malloc failed: non-constant size, in " << *Call << "\n";
+    return false;
+  }
+
+  uint64_t Size2 = 1;
+  if (Size2V != nullptr) {
+    if (auto Int = dyn_cast<ConstantInt>(Size2V)) {
+      Size2 = Int->getZExtValue();
+    } else {
+      errs() << "malloc failed: non-constant size2, in " << *Call << "\n";
+      return false;
+    }
+  }
+
+  // If `Size2` is set, set `Size = Size * Size2`, but check for overflow.
+  if (Size2 != 1) {
+    uint64_t Product;
+    if (!__builtin_mul_overflow(Size, Size2, &Product)) {
+      errs() << "malloc failed: size product overflowed, in " << *Call << "\n";
+      return false;
+    }
+    Size = Product;
+  }
+
+  uint64_t Align;
+  if (AlignV != nullptr) {
+    if (auto Int = dyn_cast<ConstantInt>(AlignV)) {
+      Align = Int->getZExtValue();
+    } else {
+      errs() << "malloc failed: non-constant align, in " << *Call << "\n";
+      return false;
+    }
+  } else {
+    Align = 8;
+  }
+
+  Optional<std::pair<Value*, uint64_t>> OutPtr = None;
+  if (OutPtrV != nullptr) {
+    OutPtr = evalBaseOffset(OutPtrV);
+    if (!OutPtr) {
+      errs() << "malloc failed: failed to evaluate out ptr, in " << *Call << "\n";
+      return false;
+    }
+  }
+
+  // Create the allocation.
+  auto Global = allocateGlobal(IntegerType::get(NewFunc->getContext(), 8), Size, Align, Zero);
+  GlobalVariable* GV = Global.first;
+  Value* Ptr = Global.second;
+
+  errs() << "malloc: allocated " << *GV << " for " << *Call << "\n";
+
+  Value* ReturnValue;
+  if (OutPtr) {
+    Mem.store(OutPtr->first, OutPtr->second, Ptr);
+    ReturnValue = ConstantInt::get(Call->getType(), 0);
+  } else {
+    ReturnValue = Ptr;
+  }
+
+  // Add the allocation to memory.  Note `GV` is the base, not `Ptr` itself.
+  EvalCache[GV] = LinearPtr(GV);
+
+  Stack.back().Locals[OldCall] = ReturnValue;
+  Call->deleteValue();
+  return true;
+}
+
+bool State::stepRealloc(CallBase* Call, CallBase* OldCall) {
+  Function* Callee = Call->getCalledFunction();
+  if (Callee == nullptr) {
+    return false;
+  }
+  LibFunc LF;
+  if (!TLI->getLibFunc(*Callee, LF)) {
+    return false;
+  }
+
+  Value* OldPtrV;
+  Value* SizeV;
+
+  switch (LF) {
+    case LibFunc_realloc:
+      OldPtrV = Call->getOperand(0);
+      SizeV = Call->getOperand(1);
+      break;
+    default:
+      errs() << "failed to handle realloc: unsupported callee in " << *Call << "\n";
+      return false;
+  }
+
+  // Convert the arguments.
+  auto OldPtr = evalBaseOffset(OldPtrV);
+  if (!OldPtr) {
+    errs() << "realloc failed: failed to evaluate ptr, in " << *Call << "\n";
+    return false;
+  }
+
+  uint64_t Size;
+  if (auto Int = dyn_cast<ConstantInt>(SizeV)) {
+    Size = Int->getZExtValue();
+  } else {
+    errs() << "realloc failed: non-constant size, in " << *Call << "\n";
+    return false;
+  }
+
+  uint64_t MemcpySize = Size;
+  if (OldPtr->second != 0) {
+    errs() << "realloc failed: old pointer has nonzero offset, in " << *Call << "\n";
+    return false;
+  } else if (OldPtr->first == nullptr) {
+    // If the old pointer is NULL, there's nothing to copy.
+    MemcpySize = 0;
+  } else if (auto OldGV = dyn_cast<GlobalVariable>(OldPtr->first)) {
+    uint64_t GVSize = DL.getTypeAllocSize(OldGV->getValueType());
+    if (GVSize < MemcpySize) {
+      MemcpySize = GVSize;
+    }
+  } else {
+    errs() << "realloc failed: couldn't get size of old pointer, in " << *Call << "\n";
+    errs() << "  old pointer is " << *OldPtr->first << "\n";
+    return false;
+  }
+
+  uint64_t Align = 8;
+  bool Zero = false;
+
+  // Create the allocation.
+  auto Global = allocateGlobal(IntegerType::get(NewFunc->getContext(), 8), Size, Align, Zero);
+  GlobalVariable* GV = Global.first;
+  Value* Ptr = Global.second;
+
+  errs() << "realloc: reallocated " << *OldPtr->first << " as " << *GV << " for " << *Call << "\n";
+
+  // Add the allocation to memory, and copy over the old contents.  Note `GV`
+  // is the base, not `Ptr` itself.
+  EvalCache[GV] = LinearPtr(GV);
+  if (MemcpySize != 0) {
+    Mem.copy(GV, 0, OldPtr->first, 0, MemcpySize);
+
+    // Emit a call to `memcpy` to initialize the new global from the old.
+    Type* SizeTy = IntegerType::get(NewFunc->getContext(), 64);
+    Type* MemcpyTys[3] = { Ptr->getType(), OldPtrV->getType(), SizeTy };
+    Function* MemcpyFunc = Intrinsic::getDeclaration(
+        NewFunc->getParent(), Intrinsic::memcpy, MemcpyTys);
+    Value* MemcpyArgs[4] = {
+      Ptr,
+      OldPtrV,
+      ConstantInt::get(SizeTy, MemcpySize),
+      ConstantInt::getFalse(NewFunc->getContext())
+    };
+    CallInst::Create(MemcpyFunc->getFunctionType(), MemcpyFunc, MemcpyArgs,
+        "", NewBB);
+  }
+
+  Stack.back().Locals[OldCall] = Ptr;
+  Call->deleteValue();
+  return true;
+}
+
+bool State::stepFree(CallBase* Call, CallBase* OldCall) {
+  Function* Callee = Call->getCalledFunction();
+  if (Callee == nullptr) {
+    return false;
+  }
+  LibFunc LF;
+  if (!TLI->getLibFunc(*Callee, LF)) {
+    return false;
+  }
+
+  switch (LF) {
+    case LibFunc_free:
+      break;
+    default:
+      errs() << "failed to handle free: unsupported callee in " << *Call << "\n";
+      return false;
+  }
+
+  // free(ptr) is a no-op in this model.
+  Call->deleteValue();
+  return true;
+}
+
+Value* State::stepAlloca(AllocaInst* Alloca) {
+  uint64_t Count;
+  if (auto Int = dyn_cast<ConstantInt>(Alloca->getArraySize())) {
+    Count = Int->getZExtValue();
+  } else {
+    errs() << "alloca failed: non-constant size, in " << *Alloca << "\n";
+    return nullptr;
+  }
+
+  uint64_t Align = 8;
+  bool Zero = false;
+
+  auto Global = allocateGlobal(Alloca->getAllocatedType(), Count, Align, Zero);
+  GlobalVariable* GV = Global.first;
+  Value* Ptr = Global.second;
+
+  EvalCache[GV] = LinearPtr(GV);
+  return Ptr;
 }
 
 Value* State::foldInst(Instruction* Inst) {
