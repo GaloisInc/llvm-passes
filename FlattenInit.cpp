@@ -250,6 +250,8 @@ struct Memory {
   void store(Value* Base, uint64_t Offset, Value* V);
   void zero(Value* Base, uint64_t Offset, uint64_t Len);
   void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
+  void copy(Value* DestBase, uint64_t DestOffset,
+      Value* SrcBase, uint64_t SrcOffset, uint64_t Len);
   void clear() {
     Regions.clear();
   }
@@ -380,6 +382,29 @@ void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
   Region.pushOp(MemStore::CreateUnknown(Offset, Len), DL);
 }
 
+void Memory::copy(Value* DestBase, uint64_t DestOffset,
+    Value* SrcBase, uint64_t SrcOffset, uint64_t Len) {
+  assert(SrcBase != DestBase && "copy within a single region is NYI");
+
+  setUnknown(DestBase, DestOffset, Len);
+
+  auto& DestRegion = getRegion(DestBase);
+  auto& SrcRegion = getRegion(SrcBase);
+  uint64_t SrcEnd = SrcOffset + Len;
+  for (auto& Store : SrcRegion.Ops) {
+    uint64_t StoreEnd = Store.getEndOffset(DL);
+    if (SrcOffset <= Store.Offset && StoreEnd <= SrcEnd) {
+      MemStore NewStore = Store;
+      NewStore.Offset = Store.Offset - SrcOffset + DestOffset;
+      DestRegion.pushOp(std::move(NewStore), DL);
+    } else if (SrcOffset < StoreEnd && Store.Offset < SrcEnd) {
+      errs() << "copy partially failed: store at " << Store.Offset << " .. " << StoreEnd <<
+          " only partially overlaps source region " << SrcOffset << " .. " << SrcEnd <<
+          ", when copying from " << *SrcBase << " to " << *DestBase << "\n";
+    }
+  }
+}
+
 
 struct StackFrame {
   Function& Func;
@@ -481,6 +506,7 @@ struct State {
   /// calls, `UnwindDest` is nullptr).
   bool stepCall(CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest);
   bool stepMemset(CallBase* Call);
+  bool stepMemcpy(CallBase* Call);
 
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
@@ -749,6 +775,12 @@ bool State::stepCall(
           return true;
         }
         break;
+      case Intrinsic::memcpy:
+        if (stepMemcpy(Call)) {
+          Stack.back().advance(NormalDest);
+          return true;
+        }
+        break;
     }
   }
   if (Callee->isVarArg()) {
@@ -807,6 +839,35 @@ bool State::stepMemset(CallBase* Call) {
   // We ignore operand 3, the `isvolatile` flag.
 
   Mem.zero(DestPtr->first, DestPtr->second, Len);
+
+  NewBB->getInstList().push_back(Call);
+  return true;
+}
+
+bool State::stepMemcpy(CallBase* Call) {
+  auto DestPtr = evalBaseOffset(Call->getOperand(0));
+  if (!DestPtr) {
+    return false;
+  }
+
+  auto SrcPtr = evalBaseOffset(Call->getOperand(1));
+  if (!SrcPtr) {
+    return false;
+  }
+
+  auto LenConst = dyn_cast<ConstantInt>(Call->getOperand(2));
+  if (LenConst == nullptr) {
+    return false;
+  }
+  uint64_t Len = LenConst->getZExtValue();
+
+  // We ignore operand 3, the `isvolatile` flag.
+
+  if (SrcPtr->first == DestPtr->first) {
+    errs() << "memcpy failed: copy within a single region is NYI, in " << *SrcPtr->first << "\n";
+  }
+
+  Mem.copy(DestPtr->first, DestPtr->second, SrcPtr->first, SrcPtr->second, Len);
 
   NewBB->getInstList().push_back(Call);
   return true;
