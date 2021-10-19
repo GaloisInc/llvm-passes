@@ -1479,7 +1479,7 @@ struct FlattenInit : public ModulePass {
 
   bool runOnModule(Module& M) override {
     Function* MainFunc = M.getFunction("main");
-    if (MainFunc == nullptr) {
+    if (MainFunc == nullptr || MainFunc->isDeclaration()) {
       return false;
     }
 
