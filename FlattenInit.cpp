@@ -205,6 +205,10 @@ struct MemStore {
   bool containsRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
     return Offset <= Start && End <= getEndOffset(DL);
   }
+
+  bool containedByRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
+    return Start <= Offset && getEndOffset(DL) <= End;
+  }
 };
 
 struct MemRegion {
@@ -402,6 +406,9 @@ void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
 
 void Memory::copy(Value* DestBase, uint64_t DestOffset,
     Value* SrcBase, uint64_t SrcOffset, uint64_t Len) {
+  errs() << "copy: dest " << *DestBase << " +" << DestOffset <<
+    ", src " << *SrcBase << " +" << SrcOffset <<
+    ", length " << Len << "\n";
   assert(SrcBase != DestBase && "copy within a single region is NYI");
 
   setUnknown(DestBase, DestOffset, Len);
@@ -410,15 +417,25 @@ void Memory::copy(Value* DestBase, uint64_t DestOffset,
   auto& SrcRegion = getRegion(SrcBase);
   uint64_t SrcEnd = SrcOffset + Len;
   for (auto& Store : SrcRegion.Ops) {
-    uint64_t StoreEnd = Store.getEndOffset(DL);
-    if (SrcOffset <= Store.Offset && StoreEnd <= SrcEnd) {
+    if (Store.containedByRange(SrcOffset, SrcEnd, DL)) {
       MemStore NewStore = Store;
       NewStore.Offset = Store.Offset - SrcOffset + DestOffset;
       DestRegion.pushOp(std::move(NewStore), DL);
-    } else if (SrcOffset < StoreEnd && Store.Offset < SrcEnd) {
-      errs() << "copy partially failed: store at " << Store.Offset << " .. " << StoreEnd <<
-          " only partially overlaps source region " << SrcOffset << " .. " << SrcEnd <<
-          ", when copying from " << *SrcBase << " to " << *DestBase << "\n";
+    } else if (Store.overlapsRange(SrcOffset, SrcEnd, DL)) {
+      if (Store.Kind == OpZero || Store.Kind == OpUnknown) {
+        uint64_t Start = std::max(SrcOffset, Store.Offset);
+        uint64_t End = std::min(SrcEnd, Store.getEndOffset(DL));
+
+        MemStore NewStore = Store;
+        NewStore.Offset = Start - SrcOffset + DestOffset;
+        NewStore.Len = End - Start;
+        DestRegion.pushOp(std::move(NewStore), DL);
+      } else {
+        errs() << "copy partially failed: store at " << Store.Offset <<
+            " only partially overlaps source region " << SrcOffset << " .. " << SrcEnd <<
+            ", when copying from " << *SrcBase << " +" << SrcOffset <<
+            " to " << *DestBase << " +" << DestOffset << "\n";
+      }
     }
   }
 }
@@ -653,6 +670,8 @@ bool State::step() {
       // Returning from the top-level function should just be passed through.
       return false;
     }
+
+    errs() << "exit function " << SF.Func.getName() << "\n";
 
     // `Return` is the new instruction (with operands already mapped), so it's
     // not invalidated when we deallocate `SF`.
