@@ -426,6 +426,10 @@ struct StackFrame {
   /// return value of that call.  When the call retuns, a mapping from
   /// `ReturnValue` to the new return value will be added to `Locals`.
   Value* ReturnValue;
+  /// When this frame is performing a call, this may be non-null to indicate
+  /// that the return value should be cast to a different type after returning.
+  /// This is used to handle casts through bitcasted function pointers.
+  Type* CastReturnType;
   /// When this frame is performing an `invoke`, this is the block to jump to
   /// if the call throws an exception.
   BasicBlock* UnwindDest;
@@ -434,7 +438,7 @@ struct StackFrame {
   /// responsible for adding argument values to `Locals`.
   StackFrame(Function& Func)
     : Func(Func), PrevBB(nullptr), CurBB(&Func.getEntryBlock()), Iter(CurBB->begin()),
-      ReturnValue(nullptr), UnwindDest(nullptr) {}
+      ReturnValue(nullptr), CastReturnType(nullptr), UnwindDest(nullptr) {}
 
   void addArgument(unsigned I, Value* V) {
     Argument* Arg = std::next(Func.arg_begin(), I);
@@ -472,6 +476,7 @@ struct UnwindContext {
 };
 
 struct State {
+  DataLayout const& DL;
   Function* NewFunc;
   BasicBlock* NewBB;
   TargetLibraryInfo* TLI;
@@ -483,8 +488,7 @@ struct State {
   SimplifyQuery SQ;
 
   State(Function& OldFunc, StringRef NewName, TargetLibraryInfo* TLI)
-    : TLI(TLI), SQ(OldFunc.getParent()->getDataLayout(), TLI),
-      Mem(OldFunc.getParent()->getDataLayout()) {
+    : DL(OldFunc.getParent()->getDataLayout()), TLI(TLI), SQ(DL, TLI), Mem(DL) {
     NewFunc = Function::Create(
         OldFunc.getFunctionType(),
         OldFunc.getLinkage(),
@@ -630,9 +634,14 @@ bool State::step() {
     Stack.pop_back();
     StackFrame& PrevSF = Stack.back();
     if (PrevSF.ReturnValue != nullptr && RetVal != nullptr) {
+      if (PrevSF.CastReturnType != nullptr) {
+        RetVal = foldAndEmitInst(CastInst::CreateBitOrPointerCast(
+              RetVal, PrevSF.CastReturnType, "returncast"));
+      }
       PrevSF.Locals[PrevSF.ReturnValue] = RetVal;
     }
     PrevSF.ReturnValue = nullptr;
+    PrevSF.CastReturnType = nullptr;
     PrevSF.UnwindDest = nullptr;
 
     Inst->deleteValue();
@@ -762,15 +771,35 @@ Value* StackFrame::mapValue(Value* OldVal) {
   return It->second;
 }
 
+Function* getCallee(Value* V) {
+  if (auto Func = dyn_cast<Function>(V)) {
+    return Func;
+  } else if (auto Expr = dyn_cast<ConstantExpr>(V)) {
+    if (Expr->getOpcode() == Instruction::BitCast) {
+      return getCallee(Expr->getOperand(0));
+    }
+  } else if (auto Cast = dyn_cast<CastInst>(V)) {
+    if (Cast->getOpcode() == Instruction::BitCast) {
+      return getCallee(Cast->getOperand(0));
+    }
+  }
+  return nullptr;
+}
+
 bool State::stepCall(
     CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest) {
-  // Make sure the callee is known.
-  // TODO: handle bitcasted constants here
-  Function* Callee = Call->getCalledFunction();
-  if (Callee == nullptr) {
+  if (isAllocationFn(Call, TLI) || isFreeCall(Call, TLI)) {
+    // Never step into malloc or free functions.  They get special handling in
+    // `step` instead.
     return false;
   }
-  if (Callee->isIntrinsic()) {
+
+  // Get the callee and the signature used for the call (which may differ from
+  // the callee's actual signature, if the callee has been bitcasted).
+  Function* Callee = getCallee(Call->getCalledOperand());
+  FunctionType* CallSig = Call->getFunctionType();
+
+  if (Callee->isIntrinsic() && CallSig == Callee->getFunctionType()) {
     // Each of `stepFoo` functions called here (e.g. `stepMemset`) is expected
     // to dispose of `Call` appropriately (either deleting it or adding it to
     // `NewBB`) if it returns `true`.
@@ -789,13 +818,9 @@ bool State::stepCall(
         break;
     }
   }
-  if (Callee->isVarArg()) {
+
+  if (Callee->isVarArg() || CallSig->isVarArg()) {
     // TODO: handle vararg calls
-    return false;
-  }
-  if (isAllocationFn(Call, TLI) || isFreeCall(Call, TLI)) {
-    // Never step into malloc or free functions.  They get special handling in
-    // `step` instead.
     return false;
   }
   if (Callee->isDeclaration()) {
@@ -803,18 +828,52 @@ bool State::stepCall(
     return false;
   }
 
+  if (Callee->getFunctionType() != CallSig) {
+    // The callee has been bitcasted to another signature.  Check for
+    // compatibility.
+    FunctionType* DefSig = Callee->getFunctionType();
+    if (CallSig->getNumParams() < DefSig->getNumParams()) {
+      // Calling with too few arguments is not supported.
+      return false;
+    }
+    for (unsigned I = 0; I < DefSig->getNumParams(); ++I) {
+      Type* CallTy = CallSig->getParamType(I);
+      Type* DefTy = DefSig->getParamType(I);
+      if (CallTy != DefTy && !CastInst::isBitOrNoopPointerCastable(CallTy, DefTy, DL)) {
+        // Argument types are not convertible.
+        return false;
+      }
+    }
+
+    Type* CallReturnTy = CallSig->getReturnType();
+    Type* DefReturnTy = CallSig->getReturnType();
+    if (CallReturnTy != DefReturnTy && !CallReturnTy->isVoidTy() &&
+        !CastInst::isBitOrNoopPointerCastable(DefReturnTy, CallReturnTy, DL)) {
+      // Return type is non-void and not convertible.
+      return false;
+    }
+  }
+
   // Advance the current frame past the call.
   StackFrame& SF = Stack.back();
   SF.advance(NormalDest);
 
   SF.ReturnValue = OldCall;
+  if (Callee->getFunctionType()->getReturnType() != CallSig->getReturnType()) {
+    SF.CastReturnType = CallSig->getReturnType();
+  }
   SF.UnwindDest = UnwindDest;
 
   // Push a new frame 
   errs() << "enter function " << Callee->getName() << "\n";
   StackFrame NewSF(*Callee);
   for (unsigned I = 0; I < Call->arg_size(); ++I) {
-    NewSF.addArgument(I, Call->getArgOperand(I));
+    Value* V = Call->getArgOperand(I);
+    Type* ExpectTy = Callee->getFunctionType()->getParamType(I);
+    if (V->getType() != ExpectTy) {
+      V = foldAndEmitInst(CastInst::CreateBitOrPointerCast(V, ExpectTy, "callcast"));
+    }
+    NewSF.addArgument(I, V);
   }
   Stack.emplace_back(std::move(NewSF));
 
@@ -1227,6 +1286,10 @@ void State::unwind() {
     Type* ReturnType = Stack[I + 1].Func.getReturnType();
     if (!ReturnType->isVoidTy()) {
       Value* PHI = PHINode::Create(ReturnType, 0, "returnval", UC.ReturnDest);
+      if (SF.CastReturnType != nullptr) {
+        PHI = foldAndEmitInst(CastInst::CreateBitOrPointerCast(
+              PHI, SF.CastReturnType, "returncast"));
+      }
       assert(SF.ReturnValue != nullptr);
       SF.Locals[SF.ReturnValue] = PHI;
     }
