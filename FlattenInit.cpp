@@ -533,7 +533,6 @@ bool State::step() {
   }
   StackFrame& SF = Stack.back();
   Instruction* OldInst = &*SF.Iter;
-  errs() << "step: " << *OldInst << "\n";
 
   // Special case: PHINode operands for the edges not taken may refer to values
   // that have no mapping in SF.Locals, so we must handle it before mapping
@@ -599,7 +598,6 @@ bool State::step() {
     Stack.pop_back();
     StackFrame& PrevSF = Stack.back();
     if (PrevSF.ReturnValue != nullptr && RetVal != nullptr) {
-      errs() << "step(return): map " << *PrevSF.ReturnValue << " -> " << *RetVal << "\n";
       PrevSF.Locals[PrevSF.ReturnValue] = RetVal;
     }
     PrevSF.ReturnValue = nullptr;
@@ -684,7 +682,6 @@ bool State::step() {
 
   SF.Locals[OldInst] = Inst;
   NewBB->getInstList().push_back(Inst);
-  errs() << "step(unknown): map " << *OldInst << " -> " << *Inst << "\n";
   ++SF.Iter;
   return true;
 }
@@ -888,9 +885,6 @@ Constant* State::constantFoldAlignmentCheck(Constant* C) {
   if (ValOr != nullptr && ValOr->getOpcode() == Instruction::Or) {
     Constant* C0 = constantFoldExtra(ConstantExpr::getAnd(ValOr->getOperand(0), Mask));
     Constant* C1 = constantFoldExtra(ConstantExpr::getAnd(ValOr->getOperand(1), Mask));
-    errs() << "found or: " << *ValOr << "\n";
-    errs() << "  C0: " << *C0 << "\n";
-    errs() << "  C1: " << *C1 << "\n";
     return constantFoldExtra(ConstantExpr::getOr(C0, C1));
   }
 
@@ -1151,8 +1145,6 @@ void State::unwind() {
       Value* PHI = PHINode::Create(ReturnType, 0, "returnval", UC.ReturnDest);
       assert(SF.ReturnValue != nullptr);
       SF.Locals[SF.ReturnValue] = PHI;
-      errs() << "  old return value = " << *SF.ReturnValue << "\n";
-      errs() << "  new return value = " << *PHI << "\n";
     }
 
     if (SF.UnwindDest != nullptr) {
@@ -1253,9 +1245,6 @@ void State::unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC
   }
 
   if (SF.UnwindDest != nullptr) {
-    errs() << "unwind dest = " << (void*)SF.UnwindDest << "\n";
-    errs() << "unwind dest = " << SF.UnwindDest->getName() << "\n";
-    SF.UnwindDest->print(errs());
     BasicBlock::iterator Iter = std::next(SF.UnwindDest->begin(), 1);
     UFS.emitPartialBlock(SF.UnwindDest, Iter, UC->UnwindDest);
   }
@@ -1306,7 +1295,6 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
   NewInst->setName(Inst->getName());
   Out->getInstList().push_back(NewInst);
 
-  errs() << "emitInst " << *Inst << "\n";
   for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
     Value* OldVal = Inst->getOperand(I);
     if (auto OldBB = dyn_cast<BasicBlock>(OldVal)) {
@@ -1314,7 +1302,6 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
       NewInst->setOperand(I, NewBB);
     } else {
       Value* NewVal = mapValue(OldVal);
-      errs() << "  operand " << I << ": " << OldVal << " " << *OldVal << " -> " << NewVal << " " << *NewVal << "\n";
       NewInst->setOperand(I, NewVal);
     }
   }
@@ -1357,7 +1344,6 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
 }
 
 void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
-  errs() << "emit " << BB->getName() << "\n";
   auto TrampIter = ExitTrampolines.find(BB);
   BasicBlock* TrampBB = nullptr;
   if (TrampIter != ExitTrampolines.end()) {
@@ -1396,7 +1382,6 @@ void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
 
 void UnwindFrameState::emitPartialBlock(
     BasicBlock* BB, BasicBlock::iterator Iter, BasicBlock* Out) {
-  errs() << "emit (partial) " << BB->getName() << "\n";
   for (Instruction& Inst : iterator_range<BasicBlock::iterator>(Iter, BB->end())) {
     if (Inst.isTerminator()) {
       break;
@@ -1416,7 +1401,6 @@ void UnwindFrameState::emitPartialBlock(
     PHINode* PHI = PHINode::Create(Inst.getType(), 1, Inst.getName(), TrampBB);
     PHI->addIncoming(mapValue(&Inst), Out);
     SF.Locals[&Inst] = PHI;
-    errs() << "trampoline: inserted mapping " << &Inst << " " << Inst << " -> " << PHI << " " << *PHI << "\n";
   }
 
   BranchInst::Create(TrampBB, Out);
