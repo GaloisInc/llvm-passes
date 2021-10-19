@@ -242,11 +242,17 @@ struct Memory {
   void initRegion(MemRegion& Region, Value* V);
   void storeConstant(MemRegion& Region, uint64_t Offset, Constant* C);
 
-  /// Attempt to load a value of type `T` from `Offset` within region `Base`.
-  /// This method returns the stored value, which may not have type `T`, but
-  /// will always be castable to `T` with `CreateBitOrPointerCast`.  It's the
-  /// caller's responsibility to detect the type mismatch and add the cast.
-  Value* load(Value* Base, uint64_t Offset, Type* T);
+  /// Load a value of type `T` from `Offset` within region `Base`.  If the
+  /// range `Offset .. Offset + Len` (where `Len` is the size in bytes of `T`)
+  /// is covered entirely by a single `OpStore`, this returns the value stored
+  /// (which may or may not have type `T`); if it's covered entirely by a
+  /// single `OpZero`, it returns a zero/null constant of type T.  The second
+  /// return value is the byte offset where the requested range begins within
+  /// the returned `Value`.  For example, if you store an 8-byte value at
+  /// offset 16, then load a 1-byte / value from offset 19 the result of the
+  /// `load` will be the stored value and the relative offset 3.  (In the
+  /// `OpZero` case, the relative offset is always 0.)
+  std::pair<Value*, uint64_t> load(Value* Base, uint64_t Offset, Type* T);
   void store(Value* Base, uint64_t Offset, Value* V);
   void zero(Value* Base, uint64_t Offset, uint64_t Len);
   void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
@@ -309,7 +315,7 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
   }
 }
 
-Value* Memory::load(Value* Base, uint64_t Offset, Type* T) {
+std::pair<Value*, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) {
   uint64_t End = Offset + DL.getTypeStoreSize(T);
 
   auto& Region = getRegion(Base);
@@ -317,30 +323,34 @@ Value* Memory::load(Value* Base, uint64_t Offset, Type* T) {
     if (Store.overlapsRange(Offset, End, DL)) {
       switch (Store.Kind) {
         case OpStore:
-          if (Store.Offset == Offset) {
-            Type* SrcTy = Store.Val->getType();
-            if (SrcTy == T || CastInst::isBitOrNoopPointerCastable(SrcTy, T, DL)) {
-              return Store.Val;
-            }
+          if (Store.containsRange(Offset, End, DL)) {
+            return std::make_pair(Store.Val, Offset - Store.Offset);
           }
+          errs() << "load failed: overlapping store starts at " << Store.Offset <<
+            ", at offset " << Offset << " in " << *Base << "\n";
           break;
         case OpZero:
           if (Store.containsRange(Offset, End, DL)) {
-            return Constant::getNullValue(T);
+            return std::make_pair(Constant::getNullValue(T), 0);
           }
+          errs() << "load failed: overlapping zero covers " << Store.Offset << " .. " <<
+            Store.getEndOffset(DL) << ", at offset " << Offset << " in " << *Base << "\n";
           break;
         case OpUnknown:
+          errs() << "load failed: overlapping unknown, at offset " << Offset <<
+            " in " << *Base << "\n";
           break;
       }
 
       // `Store` overlaps this load, but we failed to obtain an appropriate
       // value, so the result is unknown.
-      return nullptr;
+      return std::make_pair(nullptr, 0);
     }
   }
 
   // No store to this region overlaps this value.
-  return nullptr;
+  errs() << "load failed: no overlapping write, at offset " << Offset << " in " << *Base << "\n";
+  return std::make_pair(nullptr, 0);
 }
 
 void Memory::store(Value* Base, uint64_t Offset, Value* V) {
@@ -518,6 +528,10 @@ struct State {
   bool stepMemset(CallBase* Call);
   bool stepMemcpy(CallBase* Call);
 
+  // Try to convert the result of `Memory::load` to a value of type `T`.
+  // Returns null if the conversion isn't possible.
+  Value* convertLoadResult(Value* V, uint64_t Offset, Type* T);
+
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
 
@@ -676,15 +690,17 @@ bool State::step() {
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
     if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
-      if (Value* V = Mem.load(Ptr->first, Ptr->second, Load->getType())) {
-        if (V->getType() != Load->getType()) {
-          V = foldAndEmitInst(CastInst::CreateBitOrPointerCast(V, Load->getType(), "loadcast"));
+      auto Result = Mem.load(Ptr->first, Ptr->second, Load->getType());
+      if (Result.first != nullptr) {
+        if (auto V = convertLoadResult(Result.first, Result.second, Load->getType())) {
+          SF.Locals[OldInst] = V;
+          Inst->deleteValue();
+          ++SF.Iter;
+          return true;
         }
-        SF.Locals[OldInst] = V;
-        Inst->deleteValue();
-        ++SF.Iter;
-        return true;
       }
+    } else {
+      errs() << "failed to evaluate to a pointer expression: " << *Load->getPointerOperand() << "\n";
     }
   }
 
@@ -742,6 +758,39 @@ bool State::step() {
   NewBB->getInstList().push_back(Inst);
   ++SF.Iter;
   return true;
+}
+
+Value* State::convertLoadResult(Value* V, uint64_t Offset, Type* T) {
+  Type* SrcTy = V->getType();
+  if (SrcTy == T) {
+    return V;
+  }
+
+  // Check if we can just do a simple cast.
+  if (CastInst::isBitOrNoopPointerCastable(SrcTy, T, DL)) {
+    return foldAndEmitInst(CastInst::CreateBitOrPointerCast(V, T, "loadcast"));
+  }
+
+  // Complex case: extracting a byte from a larger value.
+  if (auto IntTy = dyn_cast<IntegerType>(T)) {
+    if (SrcTy->isIntOrPtrTy()) {
+      Value* Src = V;
+      if (auto SrcPtrTy = dyn_cast<PointerType>(SrcTy)) {
+        SrcTy = DL.getIntPtrType(SrcTy);
+        Src = foldAndEmitInst(new PtrToIntInst(Src, SrcTy, "loadcast"));
+      }
+      if (Offset > 0) {
+        auto ShiftAmount = ConstantInt::get(SrcTy, 8 * Offset);
+        Src = foldAndEmitInst(BinaryOperator::Create(
+              Instruction::LShr, Src, ShiftAmount, "loadshift"));
+      }
+      return foldAndEmitInst(CastInst::Create(Instruction::Trunc, Src, T, "loadtrunc"));
+    }
+  }
+
+  errs() << "load failed: can't extract " << *T << " from offset " << Offset <<
+    " of " << *V << "\n";
+  return nullptr;
 }
 
 void StackFrame::enterBlock(BasicBlock* BB) {
