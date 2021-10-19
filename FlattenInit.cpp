@@ -866,6 +866,11 @@ bool State::stepCall(
           return true;
         }
         break;
+      case Intrinsic::lifetime_start:
+      case Intrinsic::lifetime_end:
+        Stack.back().advance(NormalDest);
+        NewBB->getInstList().push_back(Call);
+        return true;
     }
   }
 
