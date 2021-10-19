@@ -284,6 +284,12 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
     for (unsigned I = 0; I < Array->getNumOperands(); ++I) {
       storeConstant(Region, Offset + I * Stride, Array->getOperand(I));
     }
+  } else if (auto DataArray = dyn_cast<ConstantDataArray>(C)) {
+    Type* ElemTy = DataArray->getElementType();
+    uint64_t Stride = DL.getTypeAllocSize(ElemTy);
+    for (unsigned I = 0; I < DataArray->getNumElements(); ++I) {
+      storeConstant(Region, Offset + I * Stride, DataArray->getElementAsConstant(I));
+    }
   } else if (auto Struct = dyn_cast<ConstantStruct>(C)) {
     const StructLayout* Layout = DL.getStructLayout(Struct->getType());
     for (unsigned I = 0; I < Struct->getNumOperands(); ++I) {
