@@ -674,10 +674,20 @@ bool State::step() {
     if (IsAlloc || IsFree) {
       if (IsAlloc) {
         if (isReallocLikeFn(Call, TLI)) {
-          // TODO: return the same pointer as the input, so reads through the
-          // new pointer return writes through the old one?
-          // TODO: handle realloc(NULL, size) as an alias for malloc(size)?
-          assert(0 && "realloc NYI");
+          if (auto Ptr = evalBaseOffset(Call->getOperand(0))) {
+            Value* Base = Ptr->first;
+            uint64_t Offset = Ptr->second;
+            if (Offset == 0) {
+              if (Base == nullptr) {
+                // `realloc(NULL, sz)` works like `malloc(sz)`.
+                EvalCache.try_emplace(Call, LinearPtr(Call));
+              } else {
+                // `realloc(ptr, sz)` returns a pointer with the same contents
+                // as `ptr`.
+                EvalCache.try_emplace(Call, LinearPtr(Base));
+              }
+            }
+          }
         } else {
           EvalCache.try_emplace(Call, LinearPtr(Call));
         }
