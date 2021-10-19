@@ -331,19 +331,13 @@ std::pair<Value*, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) 
           if (Store.containsRange(Offset, End, DL)) {
             return std::make_pair(Store.Val, Offset - Store.Offset);
           }
-          errs() << "load failed: overlapping store starts at " << Store.Offset <<
-            ", at offset " << Offset << " in " << *Base << "\n";
           break;
         case OpZero:
           if (Store.containsRange(Offset, End, DL)) {
             return std::make_pair(Constant::getNullValue(T), 0);
           }
-          errs() << "load failed: overlapping zero covers " << Store.Offset << " .. " <<
-            Store.getEndOffset(DL) << ", at offset " << Offset << " in " << *Base << "\n";
           break;
         case OpUnknown:
-          errs() << "load failed: overlapping unknown, at offset " << Offset <<
-            " in " << *Base << "\n";
           break;
       }
 
@@ -354,7 +348,6 @@ std::pair<Value*, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) 
   }
 
   // No store to this region overlaps this value.
-  errs() << "load failed: no overlapping write, at offset " << Offset << " in " << *Base << "\n";
   return std::make_pair(nullptr, 0);
 }
 
@@ -522,6 +515,7 @@ struct State {
   /// Load a single byte from memory.  Returns `nullptr` if the value of the
   /// byte is unknown.
   Value* memLoadByte(Value* Base, uint64_t Offset);
+  Value* memLoad(Value* Base, uint64_t Offset, Type* T);
   void memCopy(Value* DestBase, uint64_t DestOffset,
       Value* SrcBase, uint64_t SrcOffset, uint64_t Len);
   // Try to convert the result of `Memory::load` to a value of type `T`.
@@ -691,14 +685,11 @@ bool State::step() {
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
     if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
-      auto Result = Mem.load(Ptr->first, Ptr->second, Load->getType());
-      if (Result.first != nullptr) {
-        if (auto V = convertLoadResult(Result.first, Result.second, Load->getType())) {
-          SF.Locals[OldInst] = V;
-          Inst->deleteValue();
-          ++SF.Iter;
-          return true;
-        }
+      if (Value* V = memLoad(Ptr->first, Ptr->second, Load->getType())) {
+        SF.Locals[OldInst] = V;
+        Inst->deleteValue();
+        ++SF.Iter;
+        return true;
       }
     } else {
       errs() << "failed to evaluate to a pointer expression: " << *Load->getPointerOperand() << "\n";
@@ -915,7 +906,7 @@ bool State::stepCall(
   // Push a new frame 
   errs() << "enter function " << Callee->getName() << "\n";
   StackFrame NewSF(*Callee);
-  for (unsigned I = 0; I < Call->arg_size(); ++I) {
+  for (unsigned I = 0; I < Callee->getFunctionType()->getNumParams(); ++I) {
     Value* V = Call->getArgOperand(I);
     Type* ExpectTy = Callee->getFunctionType()->getParamType(I);
     if (V->getType() != ExpectTy) {
@@ -1268,6 +1259,45 @@ Value* State::memLoadByte(Value* Base, uint64_t Offset) {
     return nullptr;
   }
   return convertLoadResult(Result.first, Result.second, ByteTy);
+}
+
+Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
+  auto Result = Mem.load(Base, Offset, T);
+  if (Result.first != nullptr) {
+    if (auto V = convertLoadResult(Result.first, Result.second, T)) {
+      return V;
+    }
+  }
+
+  auto IntTy = dyn_cast<IntegerType>(T);
+  if (IntTy == nullptr) {
+    errs() << "memLoad failed: can't do bytewise load of " << *T << "\n";
+    return nullptr;
+  }
+
+  uint64_t Size = DL.getTypeStoreSize(T);
+  SmallVector<Value*, 8> Bytes;
+  for (uint64_t I = 0; I < Size; ++I) {
+    Value* Byte = memLoadByte(Base, Offset + I);
+    if (Byte == nullptr) {
+      errs() << "memLoad failed: can't get byte at " << *Base << " +" << (Offset + I) << "\n";
+      return nullptr;
+    }
+    Bytes.push_back(Byte);
+  }
+
+  Value* V = ConstantInt::get(IntTy, 0);
+  for (uint64_t I = 0; I < Size; ++I) {
+    Value* Byte = Bytes[I];
+    if (I > 0) {
+      auto ShiftAmount = ConstantInt::get(IntTy, 8 * I);
+      Byte = foldAndEmitInst(BinaryOperator::Create(
+            Instruction::Shl, Byte, ShiftAmount, "loadshift"));
+    }
+    V = foldAndEmitInst(BinaryOperator::Create(
+          Instruction::Or, V, Byte, "loadconcat"));
+  }
+  return V;
 }
 
 void State::memCopy(Value* DestBase, uint64_t DestOffset,
