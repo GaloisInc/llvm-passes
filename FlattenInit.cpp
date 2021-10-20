@@ -504,7 +504,7 @@ struct State {
   /// calls, `UnwindDest` is nullptr).
   bool stepCall(CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest);
   bool stepMemset(CallBase* Call);
-  bool stepMemcpy(CallBase* Call);
+  bool stepMemmove(CallBase* Call);
   bool stepMalloc(CallBase* Call, CallBase* OldCall);
   bool stepRealloc(CallBase* Call, CallBase* OldCall);
   bool stepFree(CallBase* Call, CallBase* OldCall);
@@ -864,7 +864,8 @@ bool State::stepCall(
         }
         break;
       case Intrinsic::memcpy:
-        if (stepMemcpy(Call)) {
+      case Intrinsic::memmove:
+        if (stepMemmove(Call)) {
           Stack.back().advance(NormalDest);
           return true;
         }
@@ -963,7 +964,7 @@ bool State::stepMemset(CallBase* Call) {
   return true;
 }
 
-bool State::stepMemcpy(CallBase* Call) {
+bool State::stepMemmove(CallBase* Call) {
   auto DestPtr = evalBaseOffset(Call->getOperand(0));
   if (!DestPtr) {
     return false;
@@ -983,7 +984,12 @@ bool State::stepMemcpy(CallBase* Call) {
   // We ignore operand 3, the `isvolatile` flag.
 
   if (SrcPtr->first == DestPtr->first) {
-    errs() << "memcpy failed: copy within a single region is NYI, in " << *SrcPtr->first << "\n";
+    if (SrcPtr->second == DestPtr->second) {
+      // Source and dest pointers are the same - this is a no-op.
+      Call->deleteValue();
+      return true;
+    }
+    errs() << "memmove failed: copy within a single region is NYI, in " << *SrcPtr->first << "\n";
   }
 
   memCopy(DestPtr->first, DestPtr->second, SrcPtr->first, SrcPtr->second, Len);
