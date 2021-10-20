@@ -373,6 +373,9 @@ void Memory::store(Value* Base, uint64_t Offset, Value* V) {
 }
 
 void Memory::zero(Value* Base, uint64_t Offset, uint64_t Len) {
+  if (Len == 0) {
+    return;
+  }
   uint64_t End = Offset + Len;
 
   auto& Region = getRegion(Base);
