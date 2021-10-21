@@ -982,6 +982,10 @@ bool State::stepMemset(CallBase* Call) {
 
   // We ignore operand 3, the `isvolatile` flag.
 
+  errs() << "Mem.zero: dest ";
+  DestPtr->first->printAsOperand(errs());
+  errs() << " +" << DestPtr->second << ", len " << Len << "\n";
+
   Mem.zero(DestPtr->first, DestPtr->second, Len);
 
   NewBB->getInstList().push_back(Call);
@@ -1290,6 +1294,8 @@ Value* State::stepAlloca(AllocaInst* Alloca) {
   GlobalVariable* GV = Global.first;
   Value* Ptr = Global.second;
 
+  errs() << "alloca: allocated " << *GV << " for " << *Alloca << "\n";
+
   EvalCache[GV] = LinearPtr(GV);
   return Ptr;
 }
@@ -1303,6 +1309,19 @@ Value* State::memLoadByte(Value* Base, uint64_t Offset) {
   return convertLoadResult(Result.first, Result.second, ByteTy);
 }
 
+void dumpMemRegion(MemRegion const& Region) {
+  for (auto& Store : Region.Ops) {
+    errs() << "  +" << Store.Offset << ": ";
+    if (Store.Kind == OpStore) {
+      errs() << "store ";
+      Store.Val->printAsOperand(errs());
+      errs() << "\n";
+    } else {
+      errs() << "fill " << Store.Len << " bytes with kind " << Store.Kind << "\n";
+    }
+  }
+}
+
 Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
   auto Result = Mem.load(Base, Offset, T);
   if (Result.first != nullptr) {
@@ -1313,7 +1332,15 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
 
   auto IntTy = dyn_cast<IntegerType>(T);
   if (IntTy == nullptr) {
-    errs() << "memLoad failed: can't do bytewise load of " << *T << "\n";
+    errs() << "memLoad failed: can't do bytewise load of " << *T << " from ";
+    Base->printAsOperand(errs());
+    errs() << " +" << Offset << "\n";
+
+    errs() << "dump region ";
+    Base->printAsOperand(errs());
+    errs() << ":\n";
+    dumpMemRegion(Mem.getRegion(Base));
+
     return nullptr;
   }
 
@@ -1322,7 +1349,15 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
   for (uint64_t I = 0; I < Size; ++I) {
     Value* Byte = memLoadByte(Base, Offset + I);
     if (Byte == nullptr) {
-      errs() << "memLoad failed: can't get byte at " << *Base << " +" << (Offset + I) << "\n";
+      errs() << "memLoad failed: can't get byte at ";
+      Base->printAsOperand(errs());
+      errs() << " +" << (Offset + I) << "\n";
+
+      errs() << "dump region ";
+      Base->printAsOperand(errs());
+      errs() << ":\n";
+      dumpMemRegion(Mem.getRegion(Base));
+
       return nullptr;
     }
     Bytes.push_back(Byte);
@@ -1353,6 +1388,12 @@ void State::memCopy(Value* DestBase, uint64_t DestOffset,
     memCopy(DestBase, DestOffset, TempBase.first, 0, Len);
     return;
   }
+
+  errs() << "memCopy: dest ";
+  DestBase->printAsOperand(errs());
+  errs() << " +" << DestOffset << ", src ";
+  SrcBase->printAsOperand(errs());
+  errs() << " +" << SrcOffset << ", len " << Len << "\n";
 
   Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
 
