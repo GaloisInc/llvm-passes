@@ -580,15 +580,25 @@ bool State::step() {
   StackFrame& SF = Stack.back();
   Instruction* OldInst = &*SF.Iter;
 
-  // Special case: PHINode operands for the edges not taken may refer to values
-  // that have no mapping in SF.Locals, so we must handle it before mapping
-  // operands.
-  if (auto PHI = dyn_cast<PHINode>(OldInst)) {
+  // Phi nodes need special handling: they must be executed simultaneously, not
+  // sequentially, on entry to the block.
+  if (isa<PHINode>(OldInst)) {
     assert(SF.PrevBB != nullptr);
-    Value* OldVal = PHI->getIncomingValueForBlock(SF.PrevBB);
-    Value* NewVal = SF.mapValue(OldVal);
-    SF.Locals[PHI] = NewVal;
-    ++SF.Iter;
+
+    // Compute all the new values first, so that all updates to `SF.Locals`
+    // happen at once.
+    SmallVector<std::pair<PHINode*, Value*>, 4> NewValues;
+    while (auto PHI = dyn_cast<PHINode>(&*SF.Iter)) {
+      Value* OldVal = PHI->getIncomingValueForBlock(SF.PrevBB);
+      Value* NewVal = SF.mapValue(OldVal);
+      NewValues.push_back(std::make_pair(PHI, NewVal));
+      ++SF.Iter;
+    }
+
+    for (auto& Pair : NewValues) {
+      SF.Locals[Pair.first] = Pair.second;
+    }
+
     return true;
   }
 
