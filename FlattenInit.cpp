@@ -551,7 +551,8 @@ struct State {
   Constant* constantFoldExtra(Constant* C);
   Constant* constantFoldAlignmentCheckAnd(Constant* C);
   Constant* constantFoldAlignmentCheckURem(Constant* C);
-  Constant* constantFoldAlignmentCheckPtr(Constant* C, LinearPtr* LP, uint64_t Align);
+  Constant* constantFoldAlignmentCheckPtr(
+      Constant* C, LinearPtr* LP, uint64_t Align, uint64_t Mask);
 
   /// Constant fold, plus some extra cases.  Returns nullptr if it was unable
   /// to reduce `Inst` to a constant.
@@ -1484,11 +1485,8 @@ Constant* State::constantFoldAlignmentCheckAnd(Constant* C) {
     return C;
   }
   uint64_t MaskInt = Mask->getZExtValue();
-  // Check if MaskInt is one less than a power of two.
-  if ((MaskInt & (MaskInt + 1)) != 0) {
-    return C;
-  }
-  uint64_t Align = MaskInt + 1;
+  // Get the next power of two such that `Align > MaskInt`.
+  uint64_t Align = 1 << (64 - __builtin_clz(MaskInt));
 
   // strcmp tries to be clever, and does two alignment checks at once via
   // `((ptr1 | ptr2) & 7) == 0`.  We handle this by reassociating the
@@ -1505,7 +1503,7 @@ Constant* State::constantFoldAlignmentCheckAnd(Constant* C) {
   if (Ptr == nullptr) {
     return C;
   }
-  return constantFoldAlignmentCheckPtr(C, Ptr, Align);
+  return constantFoldAlignmentCheckPtr(C, Ptr, Align, MaskInt);
 }
 
 Constant* State::constantFoldAlignmentCheckURem(Constant* C) {
@@ -1537,10 +1535,16 @@ Constant* State::constantFoldAlignmentCheckURem(Constant* C) {
     errs() << "failed to evaluate to a pointer: " << *Val << "\n";
     return C;
   }
-  return constantFoldAlignmentCheckPtr(C, Ptr, Align);
+  return constantFoldAlignmentCheckPtr(C, Ptr, Align, Align - 1);
 }
 
-Constant* State::constantFoldAlignmentCheckPtr(Constant* C, LinearPtr* LP, uint64_t Align) {
+/// Handle an alignment check of the pointer `LP`.  The allocation is adjusted
+/// to a multiple of `Align`, and the result is `Addr & Mask`.
+Constant* State::constantFoldAlignmentCheckPtr(
+    Constant* C, LinearPtr* LP, uint64_t Align, uint64_t Mask) {
+  assert(Align > Mask);
+  assert((Align & (Align - 1)) == 0 && "Align must be a power of two");
+
   for (auto& Term : LP->Terms) {
     // If the base is a global variable or function, adjust its alignment to at
     // least `Align`.
@@ -1555,10 +1559,10 @@ Constant* State::constantFoldAlignmentCheckPtr(Constant* C, LinearPtr* LP, uint6
     }
   }
 
-  // Each term's base pointer is now equal to zero mod `Align`, so the sum of
-  // all terms is also equal to zero mod `Align`.  The overall result is now
-  // equal to `LP->Offset % Align`.
-  return ConstantInt::get(C->getType(), LP->Offset & (Align - 1));
+  // Each term's base pointer is now equal to zero mod `Align`, so masking with
+  // anything less than `Align` also produces zero.  The overall result is now
+  // equal to `LP->Offset & Mask`.
+  return ConstantInt::get(C->getType(), LP->Offset & Mask);
 }
 
 Constant* State::constantFoldInstructionExtra(Instruction* Inst) {
