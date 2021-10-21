@@ -994,13 +994,10 @@ bool State::stepMemmove(CallBase* Call) {
 
   // We ignore operand 3, the `isvolatile` flag.
 
-  if (SrcPtr->first == DestPtr->first) {
-    if (SrcPtr->second == DestPtr->second) {
-      // Source and dest pointers are the same - this is a no-op.
-      Call->deleteValue();
-      return true;
-    }
-    errs() << "memmove failed: copy within a single region is NYI, in " << *SrcPtr->first << "\n";
+  if (SrcPtr->first == DestPtr->first && SrcPtr->second == DestPtr->second) {
+    // Source and dest pointers are the same - this is a no-op.
+    Call->deleteValue();
+    return true;
   }
 
   memCopy(DestPtr->first, DestPtr->second, SrcPtr->first, SrcPtr->second, Len);
@@ -1336,7 +1333,13 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
 
 void State::memCopy(Value* DestBase, uint64_t DestOffset,
     Value* SrcBase, uint64_t SrcOffset, uint64_t Len) {
-  assert(SrcBase != DestBase && "copy within a single region is NYI");
+  if (SrcBase == DestBase) {
+    // Allocate an extra buffer for temporary storage.
+    auto TempBase = allocateGlobal(IntegerType::get(NewFunc->getContext(), 8), Len, 1, false);
+    memCopy(TempBase.first, 0, SrcBase, SrcOffset, Len);
+    memCopy(DestBase, DestOffset, TempBase.first, 0, Len);
+    return;
+  }
 
   Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
 
