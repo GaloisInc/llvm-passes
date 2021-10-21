@@ -1320,6 +1320,8 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
   Value* V = ConstantInt::get(IntTy, 0);
   for (uint64_t I = 0; I < Size; ++I) {
     Value* Byte = Bytes[I];
+    Byte = foldAndEmitInst(CastInst::Create(
+          Instruction::ZExt, Byte, IntTy, "loadext"));
     if (I > 0) {
       auto ShiftAmount = ConstantInt::get(IntTy, 8 * I);
       Byte = foldAndEmitInst(BinaryOperator::Create(
