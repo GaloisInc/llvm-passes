@@ -889,6 +889,19 @@ bool State::stepCall(
     }
   }
 
+  if (Callee->getName() == "noniSetLabelU8") {
+    // A no-op, for our purposes.
+    Stack.back().advance(NormalDest);
+    Call->deleteValue();
+    return true;
+  }
+  if (Callee->getName() == "noniSinkU8") {
+    // A no-op, for our purposes.
+    Stack.back().advance(NormalDest);
+    Call->deleteValue();
+    return true;
+  }
+
   if (Callee->isDeclaration()) {
     // Function body is not available.
     return false;
