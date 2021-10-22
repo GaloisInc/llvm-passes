@@ -2422,7 +2422,7 @@ void State::updateMemory() {
       assert(0 && "alloc base is not a global variable");
     }
 
-    uint64_t Size = DL.getTypeAllocSize(GV->getType());
+    uint64_t Size = DL.getTypeAllocSize(GV->getValueType());
     memCopy(TempBase, 0, GV, 0, Size);
     MemRegion& TempRegion = Mem.getRegion(TempBase);
     std::sort(TempRegion.Ops.begin(), TempRegion.Ops.end(),
