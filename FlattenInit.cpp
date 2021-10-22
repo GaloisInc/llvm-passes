@@ -1974,6 +1974,28 @@ Optional<LinearPtr> State::evalPtrGEP(User* U) {
 
 // Unwinding
 
+std::string valueName(Value* V) {
+  if (!V->getName().empty()) {
+    return V->getName();
+  }
+
+  std::string S;
+  raw_string_ostream Out(S);
+  V->printAsOperand(Out, false);
+
+  auto Parts = StringRef(Out.str()).rsplit('%');
+  if (!Parts.second.empty()) {
+    if (isa<BasicBlock>(V)) {
+      return Twine("bb", Parts.second).str();
+    } else if (isa<Instruction>(V)) {
+      return Twine("v", Parts.second).str();
+    } else if (isa<Argument>(V)) {
+      return Twine("a", Parts.second).str();
+    }
+  }
+  return Out.str();
+}
+
 void State::unwind() {
   assert(Stack.size() > 0);
 
@@ -1989,7 +2011,8 @@ void State::unwind() {
 
     errs() << "build unwind context for " << SF.Func.getName() << "\n";
 
-    UC.ReturnDest = BasicBlock::Create(NewFunc->getContext(), "returndest", NewFunc);
+    UC.ReturnDest = BasicBlock::Create(
+        NewFunc->getContext(), Twine(SF.Func.getName(), ".returndest"), NewFunc);
     Type* ReturnType = Stack[I + 1].Func.getReturnType();
     if (!ReturnType->isVoidTy()) {
       Value* PHI = PHINode::Create(ReturnType, 0, "returnval", UC.ReturnDest);
@@ -2002,7 +2025,8 @@ void State::unwind() {
     }
 
     if (SF.UnwindDest != nullptr) {
-      UC.UnwindDest = BasicBlock::Create(NewFunc->getContext(), "unwinddest", NewFunc);
+      UC.UnwindDest = BasicBlock::Create(
+          NewFunc->getContext(), Twine(SF.Func.getName(), ".unwinddest"), NewFunc);
 
       LandingPadInst* Pad = cast<LandingPadInst>(&SF.UnwindDest->front());
       UC.LandingPads.push_back(Pad);
@@ -2146,7 +2170,9 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
   }
 
   Instruction* NewInst = Inst->clone();
-  NewInst->setName(Inst->getName());
+  if (!Inst->getType()->isVoidTy()) {
+    NewInst->setName(Twine(Inst->getFunction()->getName()) + "." + valueName(Inst));
+  }
   Out->getInstList().push_back(NewInst);
 
   for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
@@ -2245,7 +2271,9 @@ void UnwindFrameState::emitPartialBlock(
 
   // Build trampoline block.
   BasicBlock* TrampBB = BasicBlock::Create(
-      S.NewFunc->getContext(), BB->getName() + "_exit", S.NewFunc);
+      S.NewFunc->getContext(),
+      Twine(BB->getParent()->getName()) + "." + valueName(BB) + ".trampoline",
+      S.NewFunc);
   AllPreds.emplace_back(BB, TrampBB);
 
   for (Instruction& Inst : *BB) {
@@ -2301,7 +2329,10 @@ BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB) {
     return It->second;
   }
 
-  BasicBlock* NewBB = BasicBlock::Create(S.NewFunc->getContext(), OldBB->getName(), S.NewFunc);
+  BasicBlock* NewBB = BasicBlock::Create(
+      S.NewFunc->getContext(),
+      Twine(OldBB->getParent()->getName()) + "." + valueName(OldBB),
+      S.NewFunc);
   BlockMap.insert(std::make_pair(OldBB, NewBB));
   Pending.push_back(OldBB);
   return NewBB;
