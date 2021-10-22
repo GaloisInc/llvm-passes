@@ -2185,13 +2185,11 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
 
   for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
     Value* OldVal = Inst->getOperand(I);
-    if (auto OldBB = dyn_cast<BasicBlock>(OldVal)) {
-      BasicBlock* NewBB = mapBlock(OldBB, Out);
-      NewInst->setOperand(I, NewBB);
-    } else {
+    if (!isa<BasicBlock>(OldVal)) {
       Value* NewVal = mapValue(OldVal, Out);
       NewInst->setOperand(I, NewVal);
     }
+    // Basic blocks are handled below, after setting `BlockLocals[Out][Inst]`.
   }
 
   if (auto LandingPad = dyn_cast<LandingPadInst>(Inst)) {
@@ -2229,6 +2227,16 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
   }
 
   BlockLocals[Out][Inst] = NewInst;
+
+  // We call `mapBlock` only after setting `BlockLocals[Out][Inst]` so that the
+  // successor block will inherit the mapping for `Inst`.
+  for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
+    Value* OldVal = Inst->getOperand(I);
+    if (auto OldBB = dyn_cast<BasicBlock>(OldVal)) {
+      BasicBlock* NewBB = mapBlock(OldBB, Out);
+      NewInst->setOperand(I, NewBB);
+    }
+  }
 }
 
 void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
