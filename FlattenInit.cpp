@@ -679,8 +679,6 @@ bool State::step() {
       return false;
     }
 
-    //errs() << "exit function " << SF.Func.getName() << "\n";
-
     // `Return` is the new instruction (with operands already mapped), so it's
     // not invalidated when we deallocate `SF`.
     Value* RetVal = Return->getReturnValue();
@@ -1025,7 +1023,6 @@ bool State::stepCall(
   SF.UnwindDest = UnwindDest;
 
   // Push a new frame 
-  //errs() << "enter function " << Callee->getName() << "\n";
   StackFrame NewSF(*Callee);
   for (unsigned I = 0; I < Callee->getFunctionType()->getNumParams(); ++I) {
     Value* V = Call->getArgOperand(I);
@@ -1062,10 +1059,6 @@ bool State::stepMemset(CallBase* Call) {
   uint64_t Len = LenConst->getZExtValue();
 
   // We ignore operand 3, the `isvolatile` flag.
-
-  errs() << "Mem.zero: dest ";
-  DestPtr->first->printAsOperand(errs());
-  errs() << " +" << DestPtr->second << ", len " << Len << "\n";
 
   Mem.zero(DestPtr->first, DestPtr->second, Len);
 
@@ -1226,8 +1219,6 @@ bool State::stepMalloc(CallBase* Call, CallBase* OldCall) {
   GlobalVariable* GV = Global.first;
   Value* Ptr = Global.second;
 
-  errs() << "malloc: allocated " << *GV << " for " << *Call << "\n";
-
   Value* ReturnValue;
   if (OutPtr) {
     Mem.store(OutPtr->first, OutPtr->second, Ptr);
@@ -1308,8 +1299,6 @@ bool State::stepRealloc(CallBase* Call, CallBase* OldCall) {
   GlobalVariable* GV = Global.first;
   Value* Ptr = Global.second;
 
-  errs() << "realloc: reallocated " << *OldPtr->first << " as " << *GV << " for " << *Call << "\n";
-
   // Add the allocation to memory, and copy over the old contents.  Note `GV`
   // is the base, not `Ptr` itself.
   EvalCache[GV] = LinearPtr(GV);
@@ -1374,8 +1363,6 @@ Value* State::stepAlloca(AllocaInst* Alloca) {
   auto Global = allocateGlobal(Alloca->getAllocatedType(), Count, Align, Zero);
   GlobalVariable* GV = Global.first;
   Value* Ptr = Global.second;
-
-  errs() << "alloca: allocated " << *GV << " for " << *Alloca << "\n";
 
   EvalCache[GV] = LinearPtr(GV);
   return Ptr;
@@ -1499,12 +1486,6 @@ void State::memCopy(Value* DestBase, uint64_t DestOffset,
     memCopy(DestBase, DestOffset, TempBase.first, 0, Len);
     return;
   }
-
-  errs() << "memCopy: dest ";
-  DestBase->printAsOperand(errs());
-  errs() << " +" << DestOffset << ", src ";
-  SrcBase->printAsOperand(errs());
-  errs() << " +" << SrcOffset << ", len " << Len << "\n";
 
   Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
 
@@ -1680,8 +1661,6 @@ Constant* State::constantFoldAlignmentCheckURem(Constant* C) {
     return C;
   }
 
-  errs() << "looking at urem: " << *C << "\n";
-
   Constant* Val = URem->getOperand(0);;
   ConstantInt* AlignConst = dyn_cast<ConstantInt>(URem->getOperand(1));
   if (AlignConst == nullptr) {
@@ -1700,7 +1679,6 @@ Constant* State::constantFoldAlignmentCheckURem(Constant* C) {
   // Evaluate `Val` as a pointer expression.
   LinearPtr* Ptr = evalPtr(Val);
   if (Ptr == nullptr) {
-    errs() << "failed to evaluate to a pointer: " << *Val << "\n";
     return C;
   }
   return constantFoldAlignmentCheckPtr(C, Ptr, Align, Align - 1);
@@ -2432,13 +2410,6 @@ void State::updateMemory() {
     MemRegion& TempRegion = Mem.getRegion(TempBase);
     std::sort(TempRegion.Ops.begin(), TempRegion.Ops.end(),
         [](MemStore const& A, MemStore const& B) { return A.Offset < B.Offset; });
-
-    errs() << "dump sorted ops for region ";
-    Base->printAsOperand(errs());
-    errs() << ":\n";
-    for (auto& Op : TempRegion.Ops) {
-      errs() << "  " << Op.Offset << " .. " << Op.getEndOffset(DL) << ": kind = " << Op.Kind << "\n";
-    }
 
     // For each region, we build a `ConstantStruct` exactly matching the layout
     // and value found in the `MemRegion`.
