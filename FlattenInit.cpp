@@ -375,6 +375,7 @@ void Memory::store(Value* Base, uint64_t Offset, Value* V) {
       if (Store.Kind == OpStore && Store.Offset == Offset &&
           Store.getStoreSize(DL) == DL.getTypeStoreSize(V->getType())) {
         Store.Val = V;
+        Region.Written = true;
         return;
       }
 
