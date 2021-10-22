@@ -2064,7 +2064,19 @@ struct UnwindFrameState {
   State& S;
   StackFrame& SF;
   UnwindContext* PrevUC;
+
   DenseMap<BasicBlock*, BasicBlock*> BlockMap;
+  /// For each new block, a map from old values to new values.  This must be
+  /// tracked per-block (instead of everything using `SF.Locals`) because value
+  /// mappings can be overwritten when a partial block is in a loop.  For each
+  /// block, the `BlockLocals` are initialized to the final `BlockLocals` of
+  /// some predecessor (it doesn't matter which one, since only values common
+  /// to all of them can actually be used), and then the map is updated
+  /// incrementally as instructions are emitted into the block.
+  ///
+  /// Keying on the new block instead of the old one lets us track partial and
+  /// full versions of the same old block separately.
+  DenseMap<BasicBlock*, DenseMap<Value*, Value*>> BlockLocals;
   /// List of old blocks that need to be converted.  Every block in this list
   /// will also be present as a key in BlockMap.
   std::vector<BasicBlock*> Pending;
@@ -2101,12 +2113,13 @@ struct UnwindFrameState {
   void handlePHINodes();
 
   /// Map an old value to the corresponding new one.  This returns constants
-  /// unchanged, and otherwise maps values through `SF.Locals`.  It aborts if
-  /// `OldVal` is not a constant and isn't present in SF.Locals` either.
-  Value* mapValue(Value* OldVal);
+  /// unchanged, and otherwise maps values through `BlockLocals[NewBB]`.  It
+  /// aborts if `OldVal` is not a constant and isn't present in the map either.
+  Value* mapValue(Value* OldVal, BasicBlock* NewBB);
   /// Map an old basic block to the corresponding new one.  This creates the
-  /// new block if needed.
-  BasicBlock* mapBlock(BasicBlock* OldBB);
+  /// new block if needed.  When creating a new block, this initializes the new
+  /// block's `BlockLocals` entry with a copy of `BlockLocals[NewPred]`.
+  BasicBlock* mapBlock(BasicBlock* OldBB, BasicBlock* NewPred);
 };
 
 void State::unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC) {
@@ -2117,13 +2130,16 @@ void State::unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC
     // This is the innermost frame.  Emit the remaining instructions of the
     // current block directly into `NewBB`.  Other blocks will be generated as
     // needed.
+    UFS.BlockLocals[NewBB] = SF.Locals;
     UFS.emitPartialBlock(SF.CurBB, SF.Iter, NewBB);
   } else {
+    UFS.BlockLocals[UC->ReturnDest] = SF.Locals;
     UFS.emitPartialBlock(SF.CurBB, SF.Iter, UC->ReturnDest);
   }
 
   if (SF.UnwindDest != nullptr) {
     BasicBlock::iterator Iter = std::next(SF.UnwindDest->begin(), 1);
+    UFS.BlockLocals[UC->UnwindDest] = SF.Locals;
     UFS.emitPartialBlock(SF.UnwindDest, Iter, UC->UnwindDest);
   }
 
@@ -2141,7 +2157,7 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     // of two.)
     PHINode* NewPHI = PHINode::Create(
         PHI->getType(), PHI->getNumIncomingValues(), PHI->getName(), Out);
-    SF.Locals[PHI] = NewPHI;
+    BlockLocals[Out][PHI] = NewPHI;
     PHINodeMap[PHI] = NewPHI;
     return;
   }
@@ -2152,7 +2168,7 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
       Value* OldVal = Return->getReturnValue();
       if (OldVal != nullptr && !OldVal->getType()->isVoidTy()) {
         PHINode* PHI = cast<PHINode>(&*PrevUC->ReturnDest->begin());
-        Value* NewVal = mapValue(Return->getReturnValue());
+        Value* NewVal = mapValue(Return->getReturnValue(), Out);
         PHI->addIncoming(NewVal, Out);
       }
       return;
@@ -2163,7 +2179,7 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     if (PrevUC != nullptr && PrevUC->UnwindDest != nullptr) {
       BranchInst::Create(PrevUC->UnwindDest, Out);
       PHINode* PHI = cast<PHINode>(&*PrevUC->UnwindDest->begin());
-      Value* NewVal = mapValue(Resume->getValue());
+      Value* NewVal = mapValue(Resume->getValue(), Out);
       PHI->addIncoming(NewVal, Out);
       return;
     }
@@ -2178,10 +2194,10 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
   for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
     Value* OldVal = Inst->getOperand(I);
     if (auto OldBB = dyn_cast<BasicBlock>(OldVal)) {
-      BasicBlock* NewBB = mapBlock(OldBB);
+      BasicBlock* NewBB = mapBlock(OldBB, Out);
       NewInst->setOperand(I, NewBB);
     } else {
-      Value* NewVal = mapValue(OldVal);
+      Value* NewVal = mapValue(OldVal, Out);
       NewInst->setOperand(I, NewVal);
     }
   }
@@ -2220,7 +2236,7 @@ void UnwindFrameState::emitInst(Instruction* Inst, BasicBlock* Out) {
     }
   }
 
-  SF.Locals[Inst] = NewInst;
+  BlockLocals[Out][Inst] = NewInst;
 }
 
 void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
@@ -2245,13 +2261,7 @@ void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
         }
         PHINode* PHI = cast<PHINode>(&*Iter);
         ++Iter;
-        // In processing this block, all the `SF.Locals` entries from `BB` have
-        // been overwritten, replacing the trampoline PHINode with the computed
-        // value in the new full block.  We add the computed value to the
-        // PHINode, then set the `SF.Locals` entry back to the PHINode so that
-        // any later blocks will use that.
-        PHI->addIncoming(mapValue(&Inst), Out);
-        SF.Locals[&Inst] = PHI;
+        PHI->addIncoming(mapValue(&Inst, Out), Out);
       }
       BranchInst::Create(TrampBB, Out);
       return;
@@ -2275,14 +2285,19 @@ void UnwindFrameState::emitPartialBlock(
       Twine(BB->getParent()->getName()) + "." + valueName(BB) + ".trampoline",
       S.NewFunc);
   AllPreds.emplace_back(BB, TrampBB);
+  // FIXME: remove.  BlockLocals[TrampBB] should start empty, so only the phi
+  // nodes created below are visible
+  // Note `Map[X] = Map[Y]` can invalidate `Map[Y]` if `X` is not in the map.
+  auto TempLocals = BlockLocals[Out];
+  BlockLocals[TrampBB] = TempLocals;
 
   for (Instruction& Inst : *BB) {
     if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
       continue;
     }
     PHINode* PHI = PHINode::Create(Inst.getType(), 1, Inst.getName(), TrampBB);
-    PHI->addIncoming(mapValue(&Inst), Out);
-    SF.Locals[&Inst] = PHI;
+    PHI->addIncoming(mapValue(&Inst, Out), Out);
+    BlockLocals[TrampBB][&Inst] = PHI;
   }
 
   BranchInst::Create(TrampBB, Out);
@@ -2295,7 +2310,9 @@ void UnwindFrameState::emitAllBlocks() {
     BasicBlock* BB = Pending.back();
     Pending.pop_back();
 
-    BasicBlock* Out = mapBlock(BB);
+    // Everything we find in `Pending` should already have a new block created,
+    // so passing `nullptr` for the predecessor is okay here.
+    BasicBlock* Out = mapBlock(BB, nullptr);
     emitFullBlock(BB, Out);
   }
 }
@@ -2312,18 +2329,30 @@ void UnwindFrameState::handlePHINodes() {
         PHINode* NewPHI = PHINodeMap[&OldPHI];
         assert(NewPHI != nullptr && "missing entry for phi node in PHINodeMap");
         Value* OldVal = OldPHI.getIncomingValueForBlock(OldPred);
-        Value* NewVal = mapValue(OldVal);
+        Value* NewVal = mapValue(OldVal, NewPred);
         NewPHI->addIncoming(NewVal, NewPred);
       }
     }
   }
 }
 
-Value* UnwindFrameState::mapValue(Value* OldVal) {
-  return SF.mapValue(OldVal);
+Value* UnwindFrameState::mapValue(Value* OldVal, BasicBlock* NewBB) {
+  if (isa<Constant>(OldVal)) {
+    return OldVal;
+  }
+
+  auto& Locals = BlockLocals[NewBB];
+  auto It = Locals.find(OldVal);
+  if (It == Locals.end()) {
+    errs() << "error: no local mapping for value " << *OldVal << " in new block ";
+    NewBB->printAsOperand(errs());
+    errs() << "\n";
+    assert(0 && "no local mapping for value");
+  }
+  return It->second;
 }
 
-BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB) {
+BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB, BasicBlock* NewPred) {
   auto It = BlockMap.find(OldBB);
   if (It != BlockMap.end()) {
     return It->second;
@@ -2334,6 +2363,10 @@ BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB) {
       Twine(OldBB->getParent()->getName()) + "." + valueName(OldBB),
       S.NewFunc);
   BlockMap.insert(std::make_pair(OldBB, NewBB));
+  assert(NewPred != nullptr);
+  // Note `Map[X] = Map[Y]` can invalidate `Map[Y]` if `X` is not in the map.
+  auto TempLocals = BlockLocals[NewPred];
+  BlockLocals[NewBB] = TempLocals;
   Pending.push_back(OldBB);
   return NewBB;
 }
