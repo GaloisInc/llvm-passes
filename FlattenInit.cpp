@@ -220,9 +220,18 @@ struct MemRegion {
   /// Largest offset (inclusive) written within this region.  We use an
   /// inclusive range to avoid problems with wraparound.
   uint64_t MaxOffset;
+  /// Set to `true` if there has been at least one write to this region since
+  /// it was initialized.
+  bool Written;
+
+  MemRegion() : Ops(), MinOffset(0), MaxOffset(0), Written(false) {}
 
   void pushOp(MemStore Op, DataLayout const& DL) {
     uint64_t End = Op.getEndOffset(DL);
+    if (End == Op.Offset) {
+      // The size of the op is zero.  Don't actually push anything.
+      return;
+    }
     if (Ops.size() == 0) {
       MinOffset = Op.Offset;
       MaxOffset = End - 1;
@@ -235,6 +244,7 @@ struct MemRegion {
       }
     }
     Ops.push_back(Op);
+    Written = true;
   }
 };
 
@@ -272,6 +282,8 @@ MemRegion& Memory::getRegion(Value* V) {
   if (It == Regions.end()) {
     MemRegion Region;
     initRegion(Region, V);
+    // Don't count the initialization as a write.
+    Region.Written = false;
     It = Regions.try_emplace(V, std::move(Region)).first;
   }
   return It->second;
@@ -391,7 +403,10 @@ void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
   uint64_t End = Offset + Len;
 
   auto& Region = getRegion(Base);
-  if (Region.Ops.size() > 0 && Offset <= Region.MinOffset && End - 1 >= Region.MaxOffset) {
+  if (Region.Ops.size() == 0) {
+    // The region is already entirely unknown.
+    return;
+  } else if (Region.Ops.size() > 0 && Offset <= Region.MinOffset && End - 1 >= Region.MaxOffset) {
     // We're overwriting all data currently in the region.  Afterward, the
     // entire region is unknown, so we don't need to add an explicit op.
     Region.Ops.clear();
@@ -531,6 +546,15 @@ struct State {
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
 
+  /// Update global initializers to match the contents of `Mem`.
+  ///
+  /// Warning: this should be assumed to invalidate ALL stored `Value*`s,
+  /// including `StackFrame::Locals` and the values in `Mem`.  This is because
+  /// `updateMemory` deletes most `GlobalVariable`s (replacing them with new
+  /// ones), but only updates references inside LLVM objects (e.g. a `Cosntant`
+  /// that includes a pointer to the deleted `GlobalVariable`).
+  void updateMemory();
+
   Optional<std::pair<Value*, uint64_t>> evalBaseOffset(Value* V);
   LinearPtr* evalPtr(Value* V);
   Optional<LinearPtr> evalPtrImpl(Value* V);
@@ -575,6 +599,8 @@ void State::run() {
   if (Stack.size() > 0) {
     unwind();
   }
+  errs() << "\n\n\n ===== UPDATING MEMORY =====\n\n\n";
+  updateMemory();
 }
 
 bool State::step() {
@@ -737,6 +763,13 @@ bool State::step() {
 
   // Instructions that pass through, but with some special effect.
   if (auto Store = dyn_cast<StoreInst>(Inst)) {
+    if (!isa<Constant>(Store->getValueOperand())) {
+      errs() << "storing a non-constant value in " << *Store << "\n";
+      errs() << "unwinding due to (old) " << *OldInst << "\n";
+      errs() << "unwinding due to (new) " << *Inst << "\n";
+      Inst->deleteValue();
+      return false;
+    }
     if (auto Ptr = evalBaseOffset(Store->getPointerOperand())) {
       Mem.store(Ptr->first, Ptr->second, Store->getValueOperand());
     } else {
@@ -2272,6 +2305,158 @@ BasicBlock* UnwindFrameState::mapBlock(BasicBlock* OldBB) {
   BlockMap.insert(std::make_pair(OldBB, NewBB));
   Pending.push_back(OldBB);
   return NewBB;
+}
+
+
+// Memory update
+
+void State::updateMemory() {
+  unsigned Count = 0;
+  unsigned CountUnmodified = 0;
+
+  // Temporary storage.  We `memCopy` each region into this buffer, relying on
+  // the fact that `memCopy` produces a region with strictly non-overlapping
+  // memory ops.
+  auto Temp = allocateGlobal(IntegerType::get(NewFunc->getContext(), 8), 0, 1, false);
+  GlobalVariable* TempBase = Temp.first;
+  // Add `TempBase` to `Mem.Regions` preemptively, so we can access it inside
+  // the loop without invalidating the iterator.
+  Mem.getRegion(TempBase);
+
+  Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
+  Constant* ZeroByte = ConstantInt::get(ByteTy, 0);
+  Constant* UndefByte = UndefValue::get(ByteTy);
+
+  std::vector<Constant*> Fields;
+  std::vector<std::pair<GlobalVariable*, Constant*>> Replacements;
+  for (auto& Entry : Mem.Regions) {
+    if (Entry.first == TempBase) {
+      continue;
+    }
+    Value* Base = Entry.first;
+    MemRegion& Region = Entry.second;
+
+    ++Count;
+    if (!Region.Written) {
+      ++CountUnmodified;
+      continue;
+    }
+
+    auto GV = dyn_cast<GlobalVariable>(Base);
+    if (GV == nullptr) {
+      errs() << "alloc base is not a global variable: " << *Base << "\n";
+      assert(0 && "alloc base is not a global variable");
+    }
+
+    uint64_t Size = DL.getTypeAllocSize(GV->getType());
+    memCopy(TempBase, 0, GV, 0, Size);
+    MemRegion& TempRegion = Mem.getRegion(TempBase);
+    std::sort(TempRegion.Ops.begin(), TempRegion.Ops.end(),
+        [](MemStore const& A, MemStore const& B) { return A.Offset < B.Offset; });
+
+    errs() << "dump sorted ops for region ";
+    Base->printAsOperand(errs());
+    errs() << ":\n";
+    for (auto& Op : TempRegion.Ops) {
+      errs() << "  " << Op.Offset << " .. " << Op.getEndOffset(DL) << ": kind = " << Op.Kind << "\n";
+    }
+
+    // For each region, we build a `ConstantStruct` exactly matching the layout
+    // and value found in the `MemRegion`.
+    uint64_t Pos = 0;
+    for (auto& Op : TempRegion.Ops) {
+      if (Op.Offset >= Size) {
+        errs() << "warning: region ";
+        GV->printAsOperand(errs());
+        errs() << " contains out-of-bounds write at " << Op.Offset <<
+          " (size = " << Size << ")\n";
+        continue;
+      }
+
+      if (Pos > Op.Offset) {
+        errs() << "region ";
+        GV->printAsOperand(errs());
+        errs() << " has overlapping writes: found offset = " << Op.Offset <<
+          " when pos = " << Pos << "\n";
+        assert(0 && "region has overlapping writes");
+      }
+
+      while (Pos < Op.Offset) {
+        Fields.push_back(UndefByte);
+        Pos += 1;
+      }
+
+      switch (Op.Kind) {
+        case OpStore:
+          {
+            auto C = dyn_cast<Constant>(Op.Val);
+            if (C == nullptr) {
+              errs() << "region ";
+              GV->printAsOperand(errs());
+              errs() << " contains non-constant value " << *Op.Val <<
+                " (size = " << Size << ")\n";
+              assert(0 && "region contains non-constant value");
+            }
+            Fields.push_back(C);
+            Pos += DL.getTypeAllocSize(C->getType());
+          }
+          break;
+        case OpZero:
+          {
+            for (unsigned I = 0; I < Op.Len; ++I) {
+              Fields.push_back(ZeroByte);
+              Pos += 1;
+            }
+          }
+          break;
+        case OpUnknown:
+          {
+            for (unsigned I = 0; I < Op.Len; ++I) {
+              Fields.push_back(UndefByte);
+              Pos += 1;
+            }
+          }
+          break;
+      }
+    }
+    while (Pos < Size) {
+      Fields.push_back(UndefByte);
+      Pos += 1;
+    }
+    assert(Pos == Size);
+
+    Constant* Struct = ConstantStruct::getAnon(NewFunc->getContext(), Fields);
+    Fields.clear();
+    TempRegion.Ops.clear();
+    TempRegion.MinOffset = 0;
+    TempRegion.MaxOffset = 0;
+
+    // Create a new `GlobalVariable` with the new type and initializer, and
+    // replace all uses of `GV` with it.
+    GlobalVariable* NewGV = new GlobalVariable(
+        *NewFunc->getParent(),
+        Struct->getType(),
+        GV->isConstant(),
+        GV->getLinkage(),
+        Struct,
+        GV->getName(),
+        GV,
+        GV->getThreadLocalMode(),
+        GV->getAddressSpace(),
+        GV->isExternallyInitialized());
+    NewGV->copyAttributesFrom(GV);
+    Constant* BitCast = ConstantExpr::getBitCast(NewGV, GV->getType());
+    Replacements.push_back(std::make_pair(GV, BitCast));
+  }
+
+  for (auto& Repl : Replacements) {
+    Repl.first->replaceAllUsesWith(Repl.second);
+    Repl.first->eraseFromParent();
+  }
+
+  TempBase->eraseFromParent();
+
+  errs() << "processed " << Count << " memory regions (" << CountUnmodified << " unmodified)\n";
 }
 
 
