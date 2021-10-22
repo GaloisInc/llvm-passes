@@ -6,6 +6,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -480,6 +481,7 @@ struct UnwindContext {
 };
 
 struct State {
+  Pass& P;
   DataLayout const& DL;
   Function* NewFunc;
   BasicBlock* NewBB;
@@ -491,8 +493,8 @@ struct State {
 
   SimplifyQuery SQ;
 
-  State(Function& OldFunc, StringRef NewName, TargetLibraryInfo* TLI)
-    : DL(OldFunc.getParent()->getDataLayout()), TLI(TLI), SQ(DL, TLI), Mem(DL) {
+  State(Pass& P, Function& OldFunc, StringRef NewName, TargetLibraryInfo* TLI)
+    : P(P), DL(OldFunc.getParent()->getDataLayout()), TLI(TLI), SQ(DL, TLI), Mem(DL) {
     NewFunc = Function::Create(
         OldFunc.getFunctionType(),
         OldFunc.getLinkage(),
@@ -2064,6 +2066,7 @@ struct UnwindFrameState {
   State& S;
   StackFrame& SF;
   UnwindContext* PrevUC;
+  DominatorTree* DT;
 
   DenseMap<BasicBlock*, BasicBlock*> BlockMap;
   /// For each new block, a map from old values to new values.  This must be
@@ -2103,7 +2106,9 @@ struct UnwindFrameState {
   DenseMap<BasicBlock*, BasicBlock*> ExitTrampolines;
 
   UnwindFrameState(State& S, StackFrame& SF, UnwindContext* PrevUC)
-    : S(S), SF(SF), PrevUC(PrevUC) {}
+    : S(S), SF(SF), PrevUC(PrevUC) {
+    DT = &S.P.getAnalysis<DominatorTreeWrapperPass>(SF.Func).getDomTree();
+  }
 
   void emitInst(Instruction* Inst, BasicBlock* Out);
   void emitFullBlock(BasicBlock* BB, BasicBlock* Out);
@@ -2255,14 +2260,19 @@ void UnwindFrameState::emitFullBlock(BasicBlock* BB, BasicBlock* Out) {
   for (Instruction& Inst : *BB) {
     if (TrampBB != nullptr && Inst.isTerminator()) {
       auto Iter = TrampBB->begin();
-      for (Instruction& Inst : *BB) {
-        if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
-          continue;
+      DomTreeNode* Node = DT->getNode(BB);
+      while (Node != nullptr) {
+        for (Instruction& Inst : *Node->getBlock()) {
+          if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
+            continue;
+          }
+          PHINode* PHI = cast<PHINode>(&*Iter);
+          ++Iter;
+          PHI->addIncoming(mapValue(&Inst, Out), Out);
         }
-        PHINode* PHI = cast<PHINode>(&*Iter);
-        ++Iter;
-        PHI->addIncoming(mapValue(&Inst, Out), Out);
+        Node = Node->getIDom();
       }
+
       BranchInst::Create(TrampBB, Out);
       return;
     }
@@ -2279,7 +2289,8 @@ void UnwindFrameState::emitPartialBlock(
     emitInst(&Inst, Out);
   }
 
-  // Build trampoline block.
+  // Build trampoline block.  This block contains a phi node for every value
+  // visible downstream, in case it's possible to reenter BB as a full block.
   BasicBlock* TrampBB = BasicBlock::Create(
       S.NewFunc->getContext(),
       Twine(BB->getParent()->getName()) + "." + valueName(BB) + ".trampoline",
@@ -2291,13 +2302,17 @@ void UnwindFrameState::emitPartialBlock(
   auto TempLocals = BlockLocals[Out];
   BlockLocals[TrampBB] = TempLocals;
 
-  for (Instruction& Inst : *BB) {
-    if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
-      continue;
+  DomTreeNode* Node = DT->getNode(BB);
+  while (Node != nullptr) {
+    for (Instruction& Inst : *Node->getBlock()) {
+      if (Inst.isTerminator() || Inst.getType()->isVoidTy()) {
+        continue;
+      }
+      PHINode* PHI = PHINode::Create(Inst.getType(), 1, Inst.getName(), TrampBB);
+      PHI->addIncoming(mapValue(&Inst, Out), Out);
+      BlockLocals[TrampBB][&Inst] = PHI;
     }
-    PHINode* PHI = PHINode::Create(Inst.getType(), 1, Inst.getName(), TrampBB);
-    PHI->addIncoming(mapValue(&Inst, Out), Out);
-    BlockLocals[TrampBB][&Inst] = PHI;
+    Node = Node->getIDom();
   }
 
   BranchInst::Create(TrampBB, Out);
@@ -2539,7 +2554,7 @@ struct FlattenInit : public ModulePass {
     TargetLibraryInfo* TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 
     MainFunc->setName("__cc_old_main");
-    State S(*MainFunc, "main", TLI);
+    State S(*this, *MainFunc, "main", TLI);
     S.run();
 
     for (auto& BB : *S.NewFunc) {
@@ -2566,6 +2581,7 @@ struct FlattenInit : public ModulePass {
 private:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<TargetLibraryInfoWrapperPass>();
+    AU.addRequired<DominatorTreeWrapperPass>();
   }
 }; // end of struct FlattenInit
 }  // end of anonymous namespace
