@@ -599,6 +599,9 @@ void State::run() {
     // No-op
   }
   errs() << "\n\n\n ===== UNWINDING =====\n\n\n";
+  while (!NewBB->empty()) {
+    NewBB->begin()->eraseFromParent();
+  }
   if (Stack.size() > 0) {
     unwind();
   }
@@ -782,10 +785,10 @@ bool State::step() {
       return false;
     }
   } else {
-    errs() << "would unwind due to (old) " << *OldInst << "\n";
-    errs() << "would unwind due to (new) " << *Inst << "\n";
-    //Inst->deleteValue();
-    //return false;
+    errs() << "unwinding due to (old) " << *OldInst << "\n";
+    errs() << "unwinding due to (new) " << *Inst << "\n";
+    Inst->deleteValue();
+    return false;
   }
 
   SF.Locals[OldInst] = Inst;
