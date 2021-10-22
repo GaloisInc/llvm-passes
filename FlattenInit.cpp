@@ -1048,9 +1048,6 @@ bool State::stepMemset(CallBase* Call) {
   if (ValConst == nullptr) {
     return false;
   }
-  if (!ValConst->isZeroValue()) {
-    return false;
-  }
 
   auto LenConst = dyn_cast<ConstantInt>(Call->getOperand(2));
   if (LenConst == nullptr) {
@@ -1060,7 +1057,15 @@ bool State::stepMemset(CallBase* Call) {
 
   // We ignore operand 3, the `isvolatile` flag.
 
-  Mem.zero(DestPtr->first, DestPtr->second, Len);
+  if (ValConst->isZeroValue()) {
+    Mem.zero(DestPtr->first, DestPtr->second, Len);
+  } else {
+    Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
+    auto ValByte = ConstantExpr::getTrunc(ValConst, ByteTy);
+    for (unsigned I = 0; I < Len; ++I) {
+      Mem.store(DestPtr->first, DestPtr->second + I, ValByte);
+    }
+  }
 
   NewBB->getInstList().push_back(Call);
   return true;
