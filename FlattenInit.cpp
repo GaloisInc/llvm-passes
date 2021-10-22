@@ -10,6 +10,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Format.h"
 
 using namespace llvm;
 
@@ -519,6 +520,8 @@ struct State {
   /// byte is unknown.
   Value* memLoadByte(Value* Base, uint64_t Offset);
   Value* memLoad(Value* Base, uint64_t Offset, Type* T);
+  /// Load a null-terminated string pointed to by `V`.
+  std::string memLoadString(Value* V);
   void memCopy(Value* DestBase, uint64_t DestOffset,
       Value* SrcBase, uint64_t SrcOffset, uint64_t Len);
   // Try to convert the result of `Memory::load` to a value of type `T`.
@@ -648,7 +651,7 @@ bool State::step() {
       return false;
     }
 
-    errs() << "exit function " << SF.Func.getName() << "\n";
+    //errs() << "exit function " << SF.Func.getName() << "\n";
 
     // `Return` is the new instruction (with operands already mapped), so it's
     // not invalidated when we deallocate `SF`.
@@ -889,6 +892,49 @@ bool State::stepCall(
     }
   }
 
+  if (Callee->getName() == "__cc_trace") {
+    errs() << "[TRACE] " << memLoadString(Call->getArgOperand(0)) << "\n";
+    Stack.back().advance(NormalDest);
+    Call->deleteValue();
+    return true;
+  }
+  if (Callee->getName() == "__cc_trace_exec") {
+    errs() << "[FUNC] " << memLoadString(Call->getArgOperand(0)) << "(";
+    unsigned LastArg = 8;
+    Type* WordTy = IntegerType::get(NewFunc->getContext(), 64);
+    Value* Zero = ConstantInt::get(WordTy, 0);
+    while (LastArg >= 1) {
+      if (Call->getArgOperand(LastArg) == Zero) {
+        --LastArg;
+      } else {
+        break;
+      }
+    }
+    for (unsigned I = 1; I <= LastArg; ++I) {
+      if (I > 1) {
+        errs() << ", ";
+      }
+      Value* V = Call->getArgOperand(I);
+      if (auto Int = dyn_cast<ConstantInt>(V)) {
+        errs() << format_hex(Int->getZExtValue(), 0);
+        continue;
+      }
+      if (auto PtrToInt = dyn_cast<ConstantExpr>(V)) {
+        if (PtrToInt->getOpcode() == Instruction::PtrToInt) {
+          V = PtrToInt->getOperand(0);
+        }
+      }
+      if (auto GV = dyn_cast<GlobalObject>(V)) {
+        errs() << "@" << GV->getName();
+        continue;
+      }
+      errs() << *V;
+    }
+    errs() << ")\n";
+    Stack.back().advance(NormalDest);
+    Call->deleteValue();
+    return true;
+  }
   if (Callee->getName() == "noniSetLabelU8") {
     // A no-op, for our purposes.
     Stack.back().advance(NormalDest);
@@ -944,7 +990,7 @@ bool State::stepCall(
   SF.UnwindDest = UnwindDest;
 
   // Push a new frame 
-  errs() << "enter function " << Callee->getName() << "\n";
+  //errs() << "enter function " << Callee->getName() << "\n";
   StackFrame NewSF(*Callee);
   for (unsigned I = 0; I < Callee->getFunctionType()->getNumParams(); ++I) {
     Value* V = Call->getArgOperand(I);
@@ -1377,6 +1423,36 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
           Instruction::Or, V, Byte, "loadconcat"));
   }
   return V;
+}
+
+std::string State::memLoadString(Value* V) {
+  std::string S;
+  raw_string_ostream Out(S);
+
+  auto Ptr = evalBaseOffset(V);
+  if (!Ptr) {
+    return "???";
+  }
+
+  for (unsigned I = 0; ; ++I) {
+    Value* Byte = memLoadByte(Ptr->first, Ptr->second + I);
+    if (Byte == nullptr) {
+      Out << "???";
+      break;
+    }
+    auto Int = dyn_cast<ConstantInt>(Byte);
+    if (Int == nullptr) {
+      Out << "???";
+      break;
+    }
+    uint64_t Value = Int->getZExtValue();
+    if (Value == 0) {
+      break;
+    }
+    Out << (char)Value;
+  }
+
+  return Out.str();
 }
 
 void State::memCopy(Value* DestBase, uint64_t DestOffset,
