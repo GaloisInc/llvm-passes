@@ -139,6 +139,13 @@ struct LinearPtr {
 };
 
 
+typedef uint8_t Label;
+
+const Label UNTAINTED = 3;
+const Label LABEL_MASK = 3;
+const SmallVector<Label, 8> EmptyLabels;
+
+
 enum MemStoreKind {
   /// Store the value `Val` at this location.
   OpStore,
@@ -161,9 +168,10 @@ struct MemStore {
     /// The number of bytes affected, for `OpZero` and `OpUnknown`.
     uint64_t Len;
   };
+  SmallVector<Label, 8> Labels;
 
-  static MemStore CreateStore(uint64_t Offset, Value* Val) {
-    MemStore MS = { OpStore, Offset };
+  static MemStore CreateStore(uint64_t Offset, Value* Val, SmallVector<Label, 8> Labels) {
+    MemStore MS = { OpStore, Offset, 0, std::move(Labels) };
     MS.Val = Val;
     return MS;
   }
@@ -178,6 +186,13 @@ struct MemStore {
     MemStore MS = { OpUnknown, Offset };
     MS.Len = Len;
     return MS;
+  }
+
+  void setLabel(uint64_t RelOffset, Label L) {
+    if (Labels.size() <= RelOffset) {
+      Labels.resize(RelOffset + 1, UNTAINTED);
+    }
+    Labels[RelOffset] = L;
   }
 
   uint64_t getStoreSize(DataLayout const& DL) const {
@@ -203,6 +218,10 @@ struct MemStore {
 
   bool overlapsRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
     return Offset < End && Start < getEndOffset(DL);
+  }
+
+  bool contains(uint64_t O, DataLayout const& DL) const {
+    return Offset <= O && O < getEndOffset(DL);
   }
 
   bool containsRange(uint64_t Start, uint64_t End, DataLayout const& DL) const {
@@ -244,7 +263,7 @@ struct MemRegion {
         MaxOffset = End - 1;
       }
     }
-    Ops.push_back(Op);
+    Ops.push_back(std::move(Op));
     Written = true;
   }
 };
@@ -269,13 +288,15 @@ struct Memory {
   /// offset 16, then load a 1-byte / value from offset 19 the result of the
   /// `load` will be the stored value and the relative offset 3.  (In the
   /// `OpZero` case, the relative offset is always 0.)
-  std::pair<Value*, uint64_t> load(Value* Base, uint64_t Offset, Type* T);
-  void store(Value* Base, uint64_t Offset, Value* V);
+  std::tuple<Value*, SmallVector<Label, 8>, uint64_t> load(Value* Base, uint64_t Offset, Type* T);
+  void store(Value* Base, uint64_t Offset, Value* V, SmallVector<Label, 8>);
   void zero(Value* Base, uint64_t Offset, uint64_t Len);
   void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
   void clear() {
     Regions.clear();
   }
+  /// Set the labe of the byte at `Offset` within region `Base`.
+  void setLabel(Value* Base, uint64_t Offset, Label L);
 };
 
 MemRegion& Memory::getRegion(Value* V) {
@@ -324,7 +345,7 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
     Region.pushOp(MemStore::CreateZero(Offset, Len), DL);
   } else if (C->getType()->isIntOrPtrTy() || C->getType()->isFloatingPointTy()) {
     // Primitive values can be stored directly.
-    Region.pushOp(MemStore::CreateStore(Offset, C), DL);
+    Region.pushOp(MemStore::CreateStore(Offset, C, EmptyLabels), DL);
   } else if (isa<UndefValue>(C)) {
     // Do nothing - there are no defined values to store.
   } else {
@@ -334,7 +355,7 @@ void Memory::storeConstant(MemRegion& Region, uint64_t Offset, Constant* C) {
   }
 }
 
-std::pair<Value*, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) {
+std::tuple<Value*, SmallVector<Label, 8>, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) {
   uint64_t End = Offset + DL.getTypeStoreSize(T);
 
   auto& Region = getRegion(Base);
@@ -343,12 +364,12 @@ std::pair<Value*, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) 
       switch (Store.Kind) {
         case OpStore:
           if (Store.containsRange(Offset, End, DL)) {
-            return std::make_pair(Store.Val, Offset - Store.Offset);
+            return std::make_tuple(Store.Val, Store.Labels, Offset - Store.Offset);
           }
           break;
         case OpZero:
           if (Store.containsRange(Offset, End, DL)) {
-            return std::make_pair(Constant::getNullValue(T), 0);
+            return std::make_tuple(Constant::getNullValue(T), Store.Labels, 0);
           }
           break;
         case OpUnknown:
@@ -357,15 +378,15 @@ std::pair<Value*, uint64_t> Memory::load(Value* Base, uint64_t Offset, Type* T) 
 
       // `Store` overlaps this load, but we failed to obtain an appropriate
       // value, so the result is unknown.
-      return std::make_pair(nullptr, 0);
+      return std::make_tuple(nullptr, EmptyLabels, 0);
     }
   }
 
   // No store to this region overlaps this value.
-  return std::make_pair(nullptr, 0);
+  return std::make_tuple(nullptr, EmptyLabels, 0);
 }
 
-void Memory::store(Value* Base, uint64_t Offset, Value* V) {
+void Memory::store(Value* Base, uint64_t Offset, Value* V, SmallVector<Label, 8> L) {
   uint64_t End = Offset + DL.getTypeStoreSize(V->getType());
 
   auto& Region = getRegion(Base);
@@ -375,6 +396,7 @@ void Memory::store(Value* Base, uint64_t Offset, Value* V) {
       if (Store.Kind == OpStore && Store.Offset == Offset &&
           Store.getStoreSize(DL) == DL.getTypeStoreSize(V->getType())) {
         Store.Val = V;
+        Store.Labels = std::move(L);
         Region.Written = true;
         return;
       }
@@ -384,7 +406,7 @@ void Memory::store(Value* Base, uint64_t Offset, Value* V) {
     }
   }
 
-  Region.pushOp(MemStore::CreateStore(Offset, V), DL);
+  Region.pushOp(MemStore::CreateStore(Offset, V, std::move(L)), DL);
 }
 
 void Memory::zero(Value* Base, uint64_t Offset, uint64_t Len) {
@@ -417,6 +439,26 @@ void Memory::setUnknown(Value* Base, uint64_t Offset, uint64_t Len) {
   Region.pushOp(MemStore::CreateUnknown(Offset, Len), DL);
 }
 
+void Memory::setLabel(Value* Base, uint64_t Offset, Label L) {
+  auto& Region = getRegion(Base);
+  // We don't set `Region.Written` because no data is being modified.  Taint
+  // labels are handled separately.
+  for (auto& Store : make_range(Region.Ops.rbegin(), Region.Ops.rend())) {
+    if (Store.contains(Offset, DL)) {
+      uint64_t RelOffset = Offset - Store.Offset;
+      Store.setLabel(RelOffset, L);
+      return;
+    }
+  }
+  // No store overlaps this byte.
+  if (L != UNTAINTED) {
+    // Pushing an `OpUnknown` for this byte doesn't change any existing value.
+    MemStore NewStore = MemStore::CreateUnknown(Offset, 1);
+    NewStore.setLabel(0, L);
+    Region.pushOp(std::move(NewStore), DL);
+  }
+}
+
 
 struct StackFrame {
   Function& Func;
@@ -427,6 +469,10 @@ struct StackFrame {
   BasicBlock::iterator Iter;
 
   DenseMap<Value*, Value*> Locals;
+  /// For each local (identified by its old value), this gives the labels for
+  /// each byte of that local.  If a value is missing here, then it is
+  /// untainted.
+  DenseMap<Value*, SmallVector<Label, 8>> Labels;
 
   /// When this frame is performing a call, this is the old `Value` for the
   /// return value of that call.  When the call retuns, a mapping from
@@ -446,9 +492,10 @@ struct StackFrame {
     : Func(Func), PrevBB(nullptr), CurBB(&Func.getEntryBlock()), Iter(CurBB->begin()),
       ReturnValue(nullptr), CastReturnType(nullptr), UnwindDest(nullptr) {}
 
-  void addArgument(unsigned I, Value* V) {
+  void addArgument(unsigned I, Value* V, SmallVector<Label, 8> L) {
     Argument* Arg = std::next(Func.arg_begin(), I);
     Locals[Arg] = V;
+    Labels[Arg] = std::move(L);
   }
 
   void enterBlock(BasicBlock* BB);
@@ -460,6 +507,7 @@ struct StackFrame {
   void advance(BasicBlock* BB);
 
   Value* mapValue(Value* OldVal);
+  SmallVector<Label, 8> const& getLabels(Value* OldVal);
 };
 
 /// Information about the calling context, used for unwinding.
@@ -508,7 +556,7 @@ struct State {
 
     StackFrame SF(OldFunc);
     for (unsigned I = 0; I < OldFunc.arg_size(); ++I) {
-      SF.addArgument(I, std::next(NewFunc->arg_begin(), I));
+      SF.addArgument(I, std::next(NewFunc->arg_begin(), I), EmptyLabels);
     }
     Stack.emplace_back(std::move(SF));
   }
@@ -528,6 +576,7 @@ struct State {
   bool stepRealloc(CallBase* Call, CallBase* OldCall);
   bool stepFree(CallBase* Call, CallBase* OldCall);
   Value* stepAlloca(AllocaInst* Alloca);
+  bool stepSetLabel(CallBase* Call);
 
   // Allocate a new `GlobalVariable` containing an array.  This is a helper
   // function for `stepMalloc` and such.
@@ -536,8 +585,8 @@ struct State {
 
   /// Load a single byte from memory.  Returns `nullptr` if the value of the
   /// byte is unknown.
-  Value* memLoadByte(Value* Base, uint64_t Offset);
-  Value* memLoad(Value* Base, uint64_t Offset, Type* T);
+  std::pair<Value*, SmallVector<Label, 8>> memLoadByte(Value* Base, uint64_t Offset);
+  std::pair<Value*, SmallVector<Label, 8>> memLoad(Value* Base, uint64_t Offset, Type* T);
   /// Load a null-terminated string pointed to by `V`.
   std::string memLoadString(Value* V);
   void memCopy(Value* DestBase, uint64_t DestOffset,
@@ -732,8 +781,26 @@ bool State::step() {
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
     if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
-      if (Value* V = memLoad(Ptr->first, Ptr->second, Load->getType())) {
+      Value* V;
+      SmallVector<Label, 8> L;
+      std::tie(V, L) = memLoad(Ptr->first, Ptr->second, Load->getType());
+      if (V != nullptr) {
         SF.Locals[OldInst] = V;
+        if (L.size() > 0) {
+          errs() << "load ";
+          OldInst->printAsOperand(errs());
+          errs() << " from ";
+          Ptr->first->printAsOperand(errs());
+          errs() << " +" << Ptr->second << ": got labels ";
+          for (unsigned I = 0; I < L.size(); ++I) {
+            if (I > 0) {
+              errs() << ", ";
+            }
+            errs() << (int)L[I];
+          }
+          errs() << "\n";
+          SF.Labels[OldInst] = L;
+        }
         Inst->deleteValue();
         ++SF.Iter;
         return true;
@@ -775,7 +842,22 @@ bool State::step() {
       return false;
     }
     if (auto Ptr = evalBaseOffset(Store->getPointerOperand())) {
-      Mem.store(Ptr->first, Ptr->second, Store->getValueOperand());
+      Value* V = Store->getValueOperand();
+      Value* OldV = cast<StoreInst>(OldInst)->getValueOperand();
+      auto const& L = SF.getLabels(OldV);
+      if (L.size() > 0) {
+        errs() << "store to ";
+        Ptr->first->printAsOperand(errs());
+        errs() << " +" << Ptr->second << " with labels ";
+        for (unsigned I = 0; I < L.size(); ++I) {
+          if (I > 0) {
+            errs() << ", ";
+          }
+          errs() << (int)L[I];
+        }
+        errs() << "\n";
+      }
+      Mem.store(Ptr->first, Ptr->second, V, L);
     } else {
       errs() << "clear mem: unknown store dest in " << *Store << "\n";
       //Mem.clear();
@@ -853,6 +935,14 @@ Value* StackFrame::mapValue(Value* OldVal) {
   if (It == Locals.end()) {
     errs() << "error: no local mapping for value " << *OldVal << "\n";
     assert(0 && "no local mapping for value");
+  }
+  return It->second;
+}
+
+SmallVector<Label, 8> const& StackFrame::getLabels(Value* OldVal) {
+  auto It = Labels.find(OldVal);
+  if (It == Labels.end()) {
+    return EmptyLabels;
   }
   return It->second;
 }
@@ -973,10 +1063,11 @@ bool State::stepCall(
     return true;
   }
   if (Callee->getName() == "noniSetLabelU8") {
-    // A no-op, for our purposes.
-    Stack.back().advance(NormalDest);
-    Call->deleteValue();
-    return true;
+    if (stepSetLabel(Call)) {
+      Stack.back().advance(NormalDest);
+      return true;
+    }
+    return false;
   }
   if (Callee->getName() == "noniSinkU8") {
     // A no-op, for our purposes.
@@ -1034,7 +1125,7 @@ bool State::stepCall(
     if (V->getType() != ExpectTy) {
       V = foldAndEmitInst(CastInst::CreateBitOrPointerCast(V, ExpectTy, "callcast"));
     }
-    NewSF.addArgument(I, V);
+    NewSF.addArgument(I, V, SF.getLabels(OldCall->getArgOperand(I)));
   }
   Stack.emplace_back(std::move(NewSF));
 
@@ -1067,7 +1158,7 @@ bool State::stepMemset(CallBase* Call) {
     Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
     auto ValByte = ConstantExpr::getTrunc(ValConst, ByteTy);
     for (unsigned I = 0; I < Len; ++I) {
-      Mem.store(DestPtr->first, DestPtr->second + I, ValByte);
+      Mem.store(DestPtr->first, DestPtr->second + I, ValByte, EmptyLabels);
     }
   }
 
@@ -1230,7 +1321,7 @@ bool State::stepMalloc(CallBase* Call, CallBase* OldCall) {
 
   Value* ReturnValue;
   if (OutPtr) {
-    Mem.store(OutPtr->first, OutPtr->second, Ptr);
+    Mem.store(OutPtr->first, OutPtr->second, Ptr, EmptyLabels);
     ReturnValue = ConstantInt::get(Call->getType(), 0);
   } else {
     ReturnValue = Ptr;
@@ -1377,13 +1468,37 @@ Value* State::stepAlloca(AllocaInst* Alloca) {
   return Ptr;
 }
 
-Value* State::memLoadByte(Value* Base, uint64_t Offset) {
-  Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
-  auto Result = Mem.load(Base, Offset, ByteTy);
-  if (Result.first == nullptr) {
-    return nullptr;
+bool State::stepSetLabel(CallBase* Call) {
+  auto Ptr = evalBaseOffset(Call->getArgOperand(0));
+  if (!Ptr) {
+    return false;
   }
-  return convertLoadResult(Result.first, Result.second, ByteTy);
+
+  auto LabelConst = dyn_cast<ConstantInt>(Call->getArgOperand(1));
+  if (LabelConst == nullptr) {
+    return false;
+  }
+  Label L = LabelConst->getZExtValue() & LABEL_MASK;
+
+  errs() << "set label of ";
+  Ptr->first->printAsOperand(errs());
+  errs() << " +" << Ptr->second << " to " << (int)L << "\n";
+
+  Mem.setLabel(Ptr->first, Ptr->second, L);
+  Call->deleteValue();
+  return true;
+}
+
+std::pair<Value*, SmallVector<Label, 8>> State::memLoadByte(Value* Base, uint64_t Offset) {
+  Type* ByteTy = IntegerType::get(NewFunc->getContext(), 8);
+  Value* LoadVal;
+  SmallVector<Label, 8> LoadLabels;
+  uint64_t LoadOffset;
+  std::tie(LoadVal, LoadLabels, LoadOffset) = Mem.load(Base, Offset, ByteTy);
+  if (LoadVal == nullptr) {
+    return std::make_pair(nullptr, EmptyLabels);
+  }
+  return std::make_pair(convertLoadResult(LoadVal, LoadOffset, ByteTy), LoadLabels);
 }
 
 void dumpMemRegion(MemRegion const& Region) {
@@ -1399,11 +1514,14 @@ void dumpMemRegion(MemRegion const& Region) {
   }
 }
 
-Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
-  auto Result = Mem.load(Base, Offset, T);
-  if (Result.first != nullptr) {
-    if (auto V = convertLoadResult(Result.first, Result.second, T)) {
-      return V;
+std::pair<Value*, SmallVector<Label, 8>> State::memLoad(Value* Base, uint64_t Offset, Type* T) {
+  Value* LoadVal;
+  SmallVector<Label, 8> LoadLabels;
+  uint64_t LoadOffset;
+  std::tie(LoadVal, LoadLabels, LoadOffset) = Mem.load(Base, Offset, T);
+  if (LoadVal != nullptr) {
+    if (auto V = convertLoadResult(LoadVal, LoadOffset, T)) {
+      return std::make_pair(V, LoadLabels);
     }
   }
 
@@ -1418,13 +1536,16 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
     errs() << ":\n";
     dumpMemRegion(Mem.getRegion(Base));
 
-    return nullptr;
+    return std::make_pair(nullptr, EmptyLabels);
   }
 
   uint64_t Size = DL.getTypeStoreSize(T);
   SmallVector<Value*, 8> Bytes;
+  SmallVector<Label, 8> Labels;
   for (uint64_t I = 0; I < Size; ++I) {
-    Value* Byte = memLoadByte(Base, Offset + I);
+    Value* Byte;
+    SmallVector<Label, 8> ByteLabels;
+    std::tie(Byte, ByteLabels) = memLoadByte(Base, Offset + I);
     if (Byte == nullptr) {
       errs() << "memLoad failed: can't get byte at ";
       Base->printAsOperand(errs());
@@ -1435,9 +1556,15 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
       errs() << ":\n";
       dumpMemRegion(Mem.getRegion(Base));
 
-      return nullptr;
+      return std::make_pair(nullptr, EmptyLabels);
     }
     Bytes.push_back(Byte);
+    if (ByteLabels.size() > 0) {
+      if (Labels.size() <= I) {
+        Labels.resize(I + 1, UNTAINTED);
+      }
+      Labels[I] = ByteLabels[0];
+    }
   }
 
   Value* V = ConstantInt::get(IntTy, 0);
@@ -1453,7 +1580,7 @@ Value* State::memLoad(Value* Base, uint64_t Offset, Type* T) {
     V = foldAndEmitInst(BinaryOperator::Create(
           Instruction::Or, V, Byte, "loadconcat"));
   }
-  return V;
+  return std::make_pair(V, Labels);
 }
 
 std::string State::memLoadString(Value* V) {
@@ -1466,7 +1593,7 @@ std::string State::memLoadString(Value* V) {
   }
 
   for (unsigned I = 0; ; ++I) {
-    Value* Byte = memLoadByte(Ptr->first, Ptr->second + I);
+    Value* Byte = memLoadByte(Ptr->first, Ptr->second + I).first;
     if (Byte == nullptr) {
       Out << "???";
       break;
@@ -1556,7 +1683,11 @@ void State::memCopy(Value* DestBase, uint64_t DestOffset,
 
           uint64_t ByteOffset = I + SrcOffset - Store.Offset;
           Value* Byte = convertLoadResult(Store.Val, ByteOffset, ByteTy);
-          MemStore NewStore = MemStore::CreateStore(DestOffset + I, Byte);
+          SmallVector<Label, 8> Labels;
+          if (Store.Labels.size() > I) {
+            Labels.push_back(Store.Labels[I]);
+          }
+          MemStore NewStore = MemStore::CreateStore(DestOffset + I, Byte, std::move(Labels));
           DestRegion.pushOp(std::move(NewStore), DL);
           Written.set(I);
         }
@@ -2402,6 +2533,7 @@ void State::updateMemory() {
   Constant* UndefByte = UndefValue::get(ByteTy);
 
   std::vector<Constant*> Fields;
+  std::vector<std::pair<uint64_t, Label>> Labels;
   std::vector<std::pair<GlobalVariable*, Constant*>> Replacements;
   for (auto& Entry : Mem.Regions) {
     if (Entry.first == TempBase) {
@@ -2485,6 +2617,12 @@ void State::updateMemory() {
           }
           break;
       }
+
+      for (unsigned I = 0; I < Op.Labels.size(); ++I) {
+        if (Op.Labels[I] != UNTAINTED) {
+          Labels.push_back(std::make_pair(Op.Offset + I, Op.Labels[I]));
+        }
+      }
     }
     while (Pos < Size) {
       Fields.push_back(UndefByte);
@@ -2514,6 +2652,28 @@ void State::updateMemory() {
     NewGV->copyAttributesFrom(GV);
     Constant* BitCast = ConstantExpr::getBitCast(NewGV, GV->getType());
     Replacements.push_back(std::make_pair(GV, BitCast));
+
+    // Emit `noniSetLabelU8` calls to initialize taint labels in `NewGV`.
+    if (Labels.size() > 0) {
+      Type* IntTy = IntegerType::get(NewFunc->getContext(), 32);
+      FunctionCallee SetLabelFunc = NewFunc->getParent()->getOrInsertFunction(
+          "noniSetLabelU8",
+          Type::getVoidTy(NewFunc->getContext()),
+          ByteTy->getPointerTo(),
+          IntTy);
+      Instruction* FirstInst = NewBB->getFirstNonPHI();
+
+      Constant* Ptr = ConstantExpr::getBitCast(NewGV, ByteTy->getPointerTo());
+      for (auto& Entry : Labels) {
+        Value* Args[2] = {
+          ConstantExpr::getGetElementPtr(
+              ByteTy, Ptr, ConstantInt::get(IntTy, Entry.first), true),
+          ConstantInt::get(IntTy, Entry.second),
+        };
+        CallInst::Create(SetLabelFunc, Args, "", FirstInst);
+      }
+      Labels.clear();
+    }
   }
 
   for (auto& Repl : Replacements) {
