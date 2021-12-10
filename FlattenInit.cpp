@@ -1,3 +1,172 @@
+// This is the implementation of the --flatten-init pass, a.k.a. "LLVM memory
+// folding".  Its purpose is to eliminate non-secret-dependent initialization
+// code and produce an equivalent program that begins in a state where the
+// initialization has already occurred.
+//
+// The FlattenInit pass has three main effects:
+//
+// 1. Starting from the top of `main`, it inlines all function calls that occur
+//    prior to the first branch on unknown (secret) data.
+// 2. It resolves memory loads by tracking the effects of previous stores.
+// 3. It eliminates dynamic allocations by converting them to fresh globals,
+//    and eliminates stores by updating global initializers in place.
+//
+// All three parts interact closely with constant propagation: loads from known
+// globals can be converted to constants; stores to constant addresses can be
+// tracked precisely to resolve future loads; and resolving branch conditions
+// to constants allows precise determination of which code actually runs during
+// the public initialization phase.
+//
+// **Interpreter**: The implementation is structured similar to an abstract
+// interpretation, but with the "abstract domain" being LLVM `Value`s in the
+// newly-generated optimized `main`.  Each register (function argument or
+// instruction result) in the original program and each memory location is
+// mapped to a value (usually a constant, but it can also be a new instruction
+// result) in the new program.  To "interpret" an instruction from the old
+// program, the pass copies the instruction into the new program and replaces
+// all its old operands with the new values recorded in the interpreter state.
+//
+// For example, consider this pseudocode program:
+//
+// ```Python
+// def foo(a, b):
+//     x = a - a
+//     y = a + b
+//     z = x & y
+//     if z:
+//         w = a + 1
+//     else:
+//         w = b + 1
+//     if w:
+//         return 1
+//     else:
+//         return 2
+// ```
+//
+// The pass defines a new function with the same signature, and maps the old
+// arguments to the new ones:
+//
+// ```Python
+// def foo2(a2, b2):
+//     # State: a -> a2, b -> b2
+// ```
+//
+// It then begins translating instructions.  It takes the instruction `a - a`,
+// substitutes operands to produce `a2 - a2`, and applies simplification,
+// resulting in the constant `0`.  Since the result is a constant, the
+// interpreter emits no instructions and simply records that constant as the
+// value of `x`:
+//
+// ```Python
+//     # State: a -> a2, b -> b2, x -> 0
+// ```
+//
+// The instruction `a + b` can't be folded, so it is emitted instead, and a
+// mapping from the old result to the new one is recorded:
+//
+// ```Python
+//     y2 = a2 + b2
+//     # State: a -> a2, b -> b2, x -> 0, y -> y2
+// ```
+//
+// Finally, `x & y` is substituted to produce `0 & y2`, which simplifies to the
+// constant 0:
+//
+// ```Python
+//     # State: a -> a2, b -> b2, x -> 0, y -> y2, z -> 0
+// ```
+//
+// At the `if z` conditional, substitution produces `if 0`, so this is not a
+// branch on unknown data.  The interpreter simply proceeds into the false
+// case and ignores the true case.  The instruction `b + 1` is substituted to
+// produce `b2 + 1`, and that instruction is emitted and recorded in the map:
+//
+// ```Python
+//     w2 = b2 + 1
+//     # State: a -> a2, b -> b2, x -> 0, y -> y2, z -> 0, w -> w2
+// ```
+//
+// Finally, the `if w` conditional becomes `if w2`, which is a branch on an
+// unknown value.  The FlattenInit pass stops upon reaching such an
+// instruction.
+//
+// **Function calls**: When the interpreter encounters a function call, it
+// pushes a new stack frame, as in a normal interpreter.  The new program is
+// not affected in any special way; instructions from the callee are emitted
+// into the new program just as instructions from the caller were, with no
+// special distinction between the two.  This means that new-program values can
+// simply be copied into the new stack frame when passing arguments, and
+// similarly for return values.
+//
+// When the interpreter encounters an unsupported instruction (such as a branch
+// on unknown data), it stops interpreting immediately.  Instead of returning
+// normally, it begins unwinding the interpreter stack.  At each level of the
+// stack, it emits into the new program a copy of all parts of the (old)
+// function that are reachable from the current program counter.  For example,
+// given this code:
+//
+// ```Python
+// def f():
+//     x = 1
+//     g()
+//     y = 2
+//
+// def g():
+//     a = 3
+//     if unknown:
+//         b = 4
+//     c = 5
+// ```
+//
+// Upon reaching `if unknown`, the interpreter will stop.  It will first emit
+// the remainder of `g`, then pop `g`'s stack frame, and finally emit the
+// remainder of `f`.  The final program will look something like this (ignoring
+// the handling of constant RHS expressions, to keep the example simple):
+//
+// ```Python
+// def f2():
+//     x = 1
+//     a = 3
+//     # Unwinding happens here
+//     # Remainder of g:
+//     if unknown:
+//         b = 4
+//     c = 5
+//     # Remainder of f:
+//     y = 2
+// ```
+//
+// **Memory**: The interpreter models memory as a map from block ID to
+// contents.  The block ID is an LLVM `Value`, either a `GlobalReference` to a
+// global variable or an `alloca` or `malloc`-call `Instruction` (in the new
+// program).  The block contents maps each offset to the most recent write to
+// that offset.  For global variables, the block contents are initialized using
+// the global's initializer.
+//
+// When processing instructions, the interpreter can eliminate a load
+// instruction with a constant address by retrieving the value at that address
+// from its own representation of memory.  Specifically, for `x = load(a)`
+// where `a` maps to a constant `c`, instead of emitting `x2 = load(c)` and
+// recording `x -> x2`, the interpreter can retrieve the actual value `v` at
+// address `c`, emit no instructios, and record `x -> v`.
+//
+// The interpreter can eliminate many store instructions as well.  If the first
+// memory operation of the new program was a store of a constant value at a
+// constant address, we could modify the initializer of the global being
+// written to apply the store instruction's effect and then eliminate the
+// instruction itself.  The interpreter does this: as long as it hasn't emitted
+// any memory operations yet, it attempts to fold the effect of each store into
+// the global initializers so it accan avoid emitting the actual store
+// instruction.  It also handles `malloc` and `alloca` instructions by
+// replacing them with fresh globals, after which stores to these dynamic
+// allocations can be handled the same way.
+//
+// For efficiency, the interpreter does not actually update global initializers
+// incrementally as it steps through the program.  Instead, it only updates its
+// internal representation of the state of memory, and before it emits an
+// unhandled store or begins unwinding, it updates all global initializers to
+// match the internal representation.
+
 #include "llvm/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/Analysis/ConstantFolding.h"
@@ -17,8 +186,15 @@ using namespace llvm;
 
 namespace {
 
+/// A single LinearPtr term, consisting of a pointer times some coefficient.
 struct LinearTerm {
+  /// The pointer, represented as an LLVM value.  This should either be a
+  /// GlobalReference constant or an allocation Instruction such as `alloca` or
+  /// a call to `malloc`.
   Value* Ptr;
+  /// The coefficient to multiply `Ptr` by.  Addition, subtraction, and
+  /// multiplication all work the same regardless of the signedness of the
+  /// inputs, so for simplicity we make the coefficient unsigned.
   uint64_t Coeff;
 
   LinearTerm(Value* Ptr, uint64_t Coeff) : Ptr(Ptr), Coeff(Coeff) {}
@@ -62,7 +238,8 @@ void mergeTerms(SmallVector<LinearTerm, 1>& Dest, SmallVector<LinearTerm, 1> con
   }
 }
 
-/// A linear combination of pointers.
+/// A linear combination of pointers.  This is used when evaluating addresses,
+/// in order to handle complex pointer expressions like `ptr + (end - ptr)`.
 struct LinearPtr {
   SmallVector<LinearTerm, 1> Terms;
   uint64_t Offset;
@@ -102,6 +279,7 @@ struct LinearPtr {
     return std::move(add(Other.neg()));
   }
 
+  /// Multiply this pointer expression by a constant.
   LinearPtr mulConst(uint64_t Factor) const {
     LinearPtr Out = *this;
     Out.Offset *= Factor;
@@ -111,6 +289,8 @@ struct LinearPtr {
     return std::move(Out);
   }
 
+  /// Multiply this pointer expression by another pointer expression.  This
+  /// fails if it would produce a nonlinear expression, such as `ptr * ptr`.
   Optional<LinearPtr> mul(const LinearPtr& Other) const {
     if (Terms.size() > 0 && Other.Terms.size() > 0) {
       // Non-linear multiplication.
@@ -125,8 +305,9 @@ struct LinearPtr {
   }
 
   /// Try to interpret this as a base-plus-offset expression, and return the
-  /// base.  A base of `nullptr` indicates that no pointers are involved in
-  /// this expression (it's an absolute memory address instead).
+  /// base.  The offset is the value of the `this->Offset` field.  A base of
+  /// `nullptr` indicates that no pointers are involved in this expression
+  /// (it's an absolute memory address instead).
   Optional<Value*> getBase() const {
     if (Terms.size() == 0) {
       return nullptr;
@@ -159,6 +340,8 @@ enum MemStoreKind {
   OpUnknown,
 };
 
+/// A single store operation, which modifies some address range within the
+/// containing region.
 struct MemStore {
   MemStoreKind Kind;
   uint64_t Offset;
@@ -195,6 +378,7 @@ struct MemStore {
     Labels[RelOffset] = L;
   }
 
+  /// Get the number of bytes affected by this operation.
   uint64_t getStoreSize(DataLayout const& DL) const {
     switch (Kind) {
       case OpStore:
@@ -233,7 +417,9 @@ struct MemStore {
   }
 };
 
+/// The contents of a single memory allocation.
 struct MemRegion {
+  /// A list of operations performed on this region, in chronological order.
   std::vector<MemStore> Ops;
   /// Smallest offset written within this region.
   uint64_t MinOffset;
@@ -268,12 +454,17 @@ struct MemRegion {
   }
 };
 
+/// A representation of the contents of memory.  This is used to handle memory
+/// ops in the interpreter.
 struct Memory {
   DataLayout const& DL;
   DenseMap<Value*, MemRegion> Regions;
 
   Memory(DataLayout const& DL) : DL(DL) {}
 
+  /// Get the `MemRegion` representing the contents of allocation `V`.  `V`
+  /// should be either a reference to a global variable or a memory allocation
+  /// instruction.
   MemRegion& getRegion(Value* V);
   void initRegion(MemRegion& Region, Value* V);
   void storeConstant(MemRegion& Region, uint64_t Offset, Constant* C);
@@ -288,7 +479,11 @@ struct Memory {
   /// offset 16, then load a 1-byte / value from offset 19 the result of the
   /// `load` will be the stored value and the relative offset 3.  (In the
   /// `OpZero` case, the relative offset is always 0.)
+  ///
+  /// If the range `Offset .. Offset + Len` is not covered by a single
+  /// operation, the returned `Value*` is null.
   std::tuple<Value*, SmallVector<Label, 8>, uint64_t> load(Value* Base, uint64_t Offset, Type* T);
+  /// Store `V` at `Offset` within region `Base`.
   void store(Value* Base, uint64_t Offset, Value* V, SmallVector<Label, 8>);
   void zero(Value* Base, uint64_t Offset, uint64_t Len);
   void setUnknown(Value* Base, uint64_t Offset, uint64_t Len);
@@ -460,14 +655,25 @@ void Memory::setLabel(Value* Base, uint64_t Offset, Label L) {
 }
 
 
+/// A call-stack frame for the interpreter.
 struct StackFrame {
+  /// The function we're currently in.
   Function& Func;
   /// The basic block we were in before the current one.  Used when handling
   /// phi nodes.
   BasicBlock* PrevBB;
+  /// The basic block we're currently in.
   BasicBlock* CurBB;
+  /// An iterator pointing to the next instruction to execute.  `CurBB` and
+  /// `Iter` together make up the "program counter" for this frame of the
+  /// stack.
   BasicBlock::iterator Iter;
 
+  /// Map assigning values to all local registers.  The key is a register in
+  /// the original program, which is either a function argument or the result
+  /// of an instruction.  The value is the corresponding value in the new
+  /// program (`NewFunc`/`NewBB`), which can be either a constant or the result
+  /// of a new instruction.
   DenseMap<Value*, Value*> Locals;
   /// For each local (identified by its old value), this gives the labels for
   /// each byte of that local.  If a value is missing here, then it is
@@ -480,7 +686,7 @@ struct StackFrame {
   Value* ReturnValue;
   /// When this frame is performing a call, this may be non-null to indicate
   /// that the return value should be cast to a different type after returning.
-  /// This is used to handle casts through bitcasted function pointers.
+  /// This is used to handle calls through bitcasted function pointers.
   Type* CastReturnType;
   /// When this frame is performing an `invoke`, this is the block to jump to
   /// if the call throws an exception.
@@ -506,19 +712,22 @@ struct StackFrame {
   /// instructions.
   void advance(BasicBlock* BB);
 
+  /// Map an old value to the corresponding new value.  If `OldVal` is a
+  /// constant, it is returned unchanged; otherwise, this looks up `OldVal` in
+  /// `Locals`.
   Value* mapValue(Value* OldVal);
   SmallVector<Label, 8> const& getLabels(Value* OldVal);
 };
 
 /// Information about the calling context, used for unwinding.
 struct UnwindContext {
-  /// When the callee returns, it jumps to this new block and (if the return
-  /// type is non-void) adds the new return value to the phi node in this
-  /// block.
+  /// When the callee would return, instead it jumps to this new block and (if
+  /// the return type is non-void) adds the new return value to the phi node in
+  /// this block.
   BasicBlock* ReturnDest;
 
-  /// When the callee `resume`s, it jumps to this new block and adds the resume
-  /// value to the phi node in this block.
+  /// When the callee would `resume`, instead it jumps to this new block and
+  /// adds the resume value to the phi node in this block.
   BasicBlock* UnwindDest;
 
   /// List of (old) landingpad instructions of enclosing `invoke` instructions.
@@ -529,6 +738,9 @@ struct UnwindContext {
   UnwindContext() : ReturnDest(nullptr), UnwindDest(nullptr), LandingPads() {}
 };
 
+/// The complete state of the FlattenInit pass.  This contains the current
+/// memory and call stack used by the interpreter, the new function and basic
+/// block where instruction will be emitted, and a few other things.
 struct State {
   Pass& P;
   DataLayout const& DL;
@@ -565,10 +777,10 @@ struct State {
   /// Process the next instruction.  Returns `true` on success, or `false` if
   /// the next instruction can't be processed.
   bool step();
-  /// Process a call instruction.  Control resumes at `NormalDest` on success,
-  /// or at the instruction after the call if `NormalDest` is nullptr.  For
-  /// invoke instructions, `UnwindDest` gives the landing pad (for non-invoke
-  /// calls, `UnwindDest` is nullptr).
+  /// Process a call instruction.  Control resumes at `NormalDest` if the
+  /// function returns normally, or at the instruction after the call if
+  /// `NormalDest` is nullptr.  For invoke instructions, `UnwindDest` gives the
+  /// landing pad (for non-invoke calls, `UnwindDest` is nullptr).
   bool stepCall(CallBase* Call, CallBase* OldCall, BasicBlock* NormalDest, BasicBlock* UnwindDest);
   bool stepMemset(CallBase* Call);
   bool stepMemmove(CallBase* Call);
@@ -586,15 +798,20 @@ struct State {
   /// Load a single byte from memory.  Returns `nullptr` if the value of the
   /// byte is unknown.
   std::pair<Value*, SmallVector<Label, 8>> memLoadByte(Value* Base, uint64_t Offset);
+  /// Load a value of type `T` from memory.  Returns `nullptr` if the value is
+  /// unknown.
   std::pair<Value*, SmallVector<Label, 8>> memLoad(Value* Base, uint64_t Offset, Type* T);
   /// Load a null-terminated string pointed to by `V`.
   std::string memLoadString(Value* V);
   void memCopy(Value* DestBase, uint64_t DestOffset,
       Value* SrcBase, uint64_t SrcOffset, uint64_t Len);
-  // Try to convert the result of `Memory::load` to a value of type `T`.
-  // Returns null if the conversion isn't possible.
+  /// Try to convert the result of `Memory::load` to a value of type `T`.
+  /// Returns null if the conversion isn't possible.  This is a helper function
+  /// for `memLoad` etc.
   Value* convertLoadResult(Value* V, uint64_t Offset, Type* T);
 
+  /// Unwind the interpreter's call stack, emitting the remaining code for each
+  /// function on the stack.
   void unwind();
   void unwindFrame(StackFrame& SF, UnwindContext* PrevUC, UnwindContext* UC);
 
@@ -603,10 +820,11 @@ struct State {
   /// Warning: this should be assumed to invalidate ALL stored `Value*`s,
   /// including `StackFrame::Locals` and the values in `Mem`.  This is because
   /// `updateMemory` deletes most `GlobalVariable`s (replacing them with new
-  /// ones), but only updates references inside LLVM objects (e.g. a `Cosntant`
+  /// ones), but only updates references inside LLVM objects (e.g. a `Constant`
   /// that includes a pointer to the deleted `GlobalVariable`).
   void updateMemory();
 
+  /// Try to evaluate `V` into a base (pointer) and offset form.
   Optional<std::pair<Value*, uint64_t>> evalBaseOffset(Value* V);
   LinearPtr* evalPtr(Value* V);
   Optional<LinearPtr> evalPtrImpl(Value* V);
@@ -616,7 +834,7 @@ struct State {
   Optional<LinearPtr> evalPtrGEP(User* U);
 
   /// General-purpose instruction simplification and constant folding.  This
-  /// may return `Inst` itself, some other existing instruction, or a constant.
+  /// may return `Inst` itself, some existing new instruction, or a constant.
   Value* foldInst(Instruction* Inst);
   /// Apply `foldInst` to `Inst`, emit `Inst` into `NewBB` if needed, and
   /// return the resulting value.  `Inst` will be deleted automatically if this
@@ -625,9 +843,10 @@ struct State {
   /// method should be used when synthesizing a new instruction from scratch.
   Value* foldAndEmitInst(Instruction* Inst);
 
+  /// Constant fold, plus some extra cases.
+  Constant* constantFoldExtra(Constant* C);
   /// Wrapper around llvm::ConstantFoldConstant.
   Constant* constantFoldConstant(Constant* C);
-  Constant* constantFoldExtra(Constant* C);
   Constant* constantFoldAlignmentCheckAnd(Constant* C);
   Constant* constantFoldAlignmentCheckURem(Constant* C);
   Constant* constantFoldAlignmentCheckPtr(
@@ -834,6 +1053,11 @@ bool State::step() {
 
   // Instructions that pass through, but with some special effect.
   if (auto Store = dyn_cast<StoreInst>(Inst)) {
+    // We could actually handle some of these cases (e.g. stores of
+    // non-constant values) without bailing out, but we'd have to call
+    // `updateMemory()` before handling the instruction, which would require
+    // improving `updateMemory` so it doesn't invalidate `Locals` and other
+    // tables that store `Value`s.
     if (!isa<Constant>(Store->getValueOperand())) {
       errs() << "storing a non-constant value in " << *Store << "\n";
       errs() << "unwinding due to (old) " << *OldInst << "\n";
@@ -1019,6 +1243,7 @@ bool State::stepCall(
     }
   }
 
+  // Handle MicroRAM intrinsics.
   if (Callee->getName() == "__cc_trace") {
     errs() << "[TRACE] " << memLoadString(Call->getArgOperand(0)) << "\n";
     Stack.back().advance(NormalDest);
@@ -1117,7 +1342,7 @@ bool State::stepCall(
   }
   SF.UnwindDest = UnwindDest;
 
-  // Push a new frame 
+  // Push a new frame to run the callee.
   StackFrame NewSF(*Callee);
   for (unsigned I = 0; I < Callee->getFunctionType()->getNumParams(); ++I) {
     Value* V = Call->getArgOperand(I);
@@ -1743,7 +1968,6 @@ Constant* State::constantFoldConstant(Constant* C) {
   }
 }
 
-/// Apply extra constant folding for certain special cases.
 Constant* State::constantFoldExtra(Constant* C) {
   C = constantFoldAlignmentCheckAnd(C);
   C = constantFoldAlignmentCheckURem(C);
@@ -1916,6 +2140,9 @@ Constant* State::constantFoldNullCheckInst(Instruction* Inst) {
   }
 }
 
+/// Equality checks between two pointers.  We handle `ptr1 == ptr2` by
+/// evaluating both pointers to `LinearPtr`s and checking if their bases and
+/// offsets are the same.
 Constant* State::constantFoldPointerCompare(Instruction* Inst) {
   auto ICmp = dyn_cast<ICmpInst>(Inst);
   if (ICmp == nullptr || !ICmp->isEquality()) {
