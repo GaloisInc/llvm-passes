@@ -2145,7 +2145,7 @@ Constant* State::constantFoldNullCheckInst(Instruction* Inst) {
 /// offsets are the same.
 Constant* State::constantFoldPointerCompare(Instruction* Inst) {
   auto ICmp = dyn_cast<ICmpInst>(Inst);
-  if (ICmp == nullptr || !ICmp->isEquality()) {
+  if (ICmp == nullptr || ICmp->getPredicate() != CmpInst::ICMP_EQ) {
     return nullptr;
   }
 
