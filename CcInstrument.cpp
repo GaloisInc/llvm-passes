@@ -8,7 +8,7 @@
 using namespace llvm;
 
 const int WORD_SIZE = 64;
-const size_t TRACE_NUM_ARGS = 8;
+const size_t TRACE_NUM_ARGS = 4;
 
 namespace {
 struct CcInstrument : public FunctionPass {

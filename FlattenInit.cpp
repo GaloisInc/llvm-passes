@@ -1297,7 +1297,7 @@ bool State::stepCall(
   }
   if (Callee->getName() == "__cc_trace_exec") {
     errs() << "[FUNC] " << memLoadString(Call->getArgOperand(0)) << "(";
-    unsigned LastArg = 8;
+    unsigned LastArg = 4;
     Type* WordTy = IntegerType::get(NewFunc->getContext(), 64);
     Value* Zero = ConstantInt::get(WordTy, 0);
     while (LastArg >= 1) {
