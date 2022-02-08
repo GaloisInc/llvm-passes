@@ -322,9 +322,11 @@ struct LinearPtr {
 
 typedef uint8_t Label;
 
-const Label UNTAINTED = 3;
+const Label BOTTOM = 3;
+const Label MAYBE_TAINTED = 2;
 const Label LABEL_MASK = 3;
 const SmallVector<Label, 8> EmptyLabels;
+const SmallVector<Label, 8> MaybeTaintedLabels(8, MAYBE_TAINTED);
 
 
 enum MemStoreKind {
@@ -373,7 +375,7 @@ struct MemStore {
 
   void setLabel(uint64_t RelOffset, Label L) {
     if (Labels.size() <= RelOffset) {
-      Labels.resize(RelOffset + 1, UNTAINTED);
+      Labels.resize(RelOffset + 1, BOTTOM);
     }
     Labels[RelOffset] = L;
   }
@@ -646,7 +648,7 @@ void Memory::setLabel(Value* Base, uint64_t Offset, Label L) {
     }
   }
   // No store overlaps this byte.
-  if (L != UNTAINTED) {
+  if (L != BOTTOM) {
     // Pushing an `OpUnknown` for this byte doesn't change any existing value.
     MemStore NewStore = MemStore::CreateUnknown(Offset, 1);
     NewStore.setLabel(0, L);
@@ -842,6 +844,11 @@ struct State {
   /// `Value*` is guaranteed to evaluate to the same value as `Inst`).  This
   /// method should be used when synthesizing a new instruction from scratch.
   Value* foldAndEmitInst(Instruction* Inst);
+  // Compute the label for a folded instruction.
+  SmallVector<Label, 8> labelInst(StackFrame* SF, Instruction* Inst);
+
+  // Check that the label is BOTTOM or error out.
+  void checkBottom(SmallVector<Label, 8> L);
 
   /// Constant fold, plus some extra cases.
   Constant* constantFoldExtra(Constant* C);
@@ -891,16 +898,18 @@ bool State::step() {
 
     // Compute all the new values first, so that all updates to `SF.Locals`
     // happen at once.
-    SmallVector<std::pair<PHINode*, Value*>, 4> NewValues;
+    SmallVector<std::tuple<PHINode*, Value*, SmallVector<Label, 8>>, 4> NewValues;
     while (auto PHI = dyn_cast<PHINode>(&*SF.Iter)) {
       Value* OldVal = PHI->getIncomingValueForBlock(SF.PrevBB);
       Value* NewVal = SF.mapValue(OldVal);
-      NewValues.push_back(std::make_pair(PHI, NewVal));
+      SmallVector<Label, 8> OldLabel = SF.getLabels(OldVal);
+      NewValues.push_back(std::make_tuple(PHI, NewVal, OldLabel));
       ++SF.Iter;
     }
 
     for (auto& Pair : NewValues) {
-      SF.Locals[Pair.first] = Pair.second;
+      SF.Locals[std::get<0>(Pair)] = std::get<1>(Pair);
+      SF.Labels[std::get<0>(Pair)] = std::get<2>(Pair);
     }
 
     return true;
@@ -922,6 +931,8 @@ bool State::step() {
   Value* Folded = foldInst(Inst);
   if (Folded != Inst) {
     SF.Locals[OldInst] = Folded;
+    SmallVector<Label, 8> FoldedLabel = labelInst(&SF, Inst);
+    SF.Labels[OldInst] = FoldedLabel;
     Inst->deleteValue();
     ++SF.Iter;
     return true;
@@ -935,12 +946,22 @@ bool State::step() {
   // not defined, in which case we pass it through as an unknown instruction.
   if (auto Call = dyn_cast<CallInst>(Inst)) {
     if (stepCall(Call, cast<CallInst>(OldInst), nullptr, nullptr)) {
+      // Checks on target.
+      auto Callee = Call->getCalledOperand();
+      auto const& CalleeL = SF.getLabels(Callee);
+      checkBottom(CalleeL);
+
       return true;
     }
   }
   if (auto Invoke = dyn_cast<InvokeInst>(Inst)) {
     if (stepCall(Invoke, cast<InvokeInst>(OldInst), 
           Invoke->getNormalDest(), Invoke->getUnwindDest())) {
+      // Checks on target.
+      auto Callee = Invoke->getCalledOperand();
+      auto const& CalleeL = SF.getLabels(Callee);
+      checkBottom(CalleeL);
+
       return true;
     }
   }
@@ -954,6 +975,7 @@ bool State::step() {
     // `Return` is the new instruction (with operands already mapped), so it's
     // not invalidated when we deallocate `SF`.
     Value* RetVal = Return->getReturnValue();
+    auto const& RetL = SF.getLabels(RetVal);
 
     Stack.pop_back();
     StackFrame& PrevSF = Stack.back();
@@ -962,6 +984,8 @@ bool State::step() {
         RetVal = foldAndEmitInst(CastInst::CreateBitOrPointerCast(
               RetVal, PrevSF.CastReturnType, "returncast"));
       }
+      // Propagate label for returned value.
+      PrevSF.Labels[PrevSF.ReturnValue] = RetL;
       PrevSF.Locals[PrevSF.ReturnValue] = RetVal;
     }
     PrevSF.ReturnValue = nullptr;
@@ -975,16 +999,21 @@ bool State::step() {
 
   if (auto Branch = dyn_cast<BranchInst>(Inst)) {
     if (Branch->isUnconditional()) {
-      SF.enterBlock(Branch->getSuccessor(0));
+      // Taint analysis checks on target are unnecessary since the successor is a compile-time constant.
+      auto Succ = Branch->getSuccessor(0);
+
+      SF.enterBlock(Succ);
       Inst->deleteValue();
       return true;
     } else {
       if (auto ConstCond = dyn_cast<Constant>(Branch->getCondition())) {
-        if (ConstCond->isOneValue()) {
-          SF.enterBlock(Branch->getSuccessor(0));
-        } else {
-          SF.enterBlock(Branch->getSuccessor(1));
-        }
+        // Checks on conditional.
+        auto const& CondL = SF.getLabels(ConstCond);
+        checkBottom(CondL);
+        // Taint analysis checks on target are unnecessary since the successor is a compile-time constant.
+        auto Succ = ConstCond->isOneValue() ? Branch->getSuccessor(0) : Branch->getSuccessor(1);
+
+        SF.enterBlock(Succ);
         Inst->deleteValue();
         return true;
       }
@@ -992,14 +1021,25 @@ bool State::step() {
   }
   if (auto Switch = dyn_cast<SwitchInst>(Inst)) {
     if (auto ConstCond = dyn_cast<ConstantInt>(Switch->getCondition())) {
-      SF.enterBlock(Switch->findCaseValue(ConstCond)->getCaseSuccessor());
+      // Checks on target and conditional.
+      auto const& CondL = SF.getLabels(ConstCond);
+      checkBottom(CondL);
+      // Taint analysis checks on target are unnecessary since the successor is a compile-time constant.
+      auto Succ = Switch->findCaseValue(ConstCond)->getCaseSuccessor();
+
+      SF.enterBlock(Succ);
       Inst->deleteValue();
       return true;
     }
   }
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
-    if (auto Ptr = evalBaseOffset(Load->getPointerOperand())) {
+    auto RawPtr = Load->getPointerOperand();
+    if (auto Ptr = evalBaseOffset(RawPtr)) {
+      // Checks on addr.
+      auto const& AddrL = SF.getLabels(RawPtr);
+      checkBottom(AddrL);
+
       Value* V;
       SmallVector<Label, 8> L;
       std::tie(V, L) = memLoad(Ptr->first, Ptr->second, Load->getType());
@@ -1065,7 +1105,12 @@ bool State::step() {
       Inst->deleteValue();
       return false;
     }
-    if (auto Ptr = evalBaseOffset(Store->getPointerOperand())) {
+    auto RawPtr = Store->getPointerOperand();
+    if (auto Ptr = evalBaseOffset(RawPtr)) {
+      // Checks on addr.
+      auto const& AddrL = SF.getLabels(RawPtr);
+      checkBottom(AddrL);
+
       Value* V = Store->getValueOperand();
       Value* OldV = cast<StoreInst>(OldInst)->getValueOperand();
       auto const& L = SF.getLabels(OldV);
@@ -1786,7 +1831,7 @@ std::pair<Value*, SmallVector<Label, 8>> State::memLoad(Value* Base, uint64_t Of
     Bytes.push_back(Byte);
     if (ByteLabels.size() > 0) {
       if (Labels.size() <= I) {
-        Labels.resize(I + 1, UNTAINTED);
+        Labels.resize(I + 1, BOTTOM);
       }
       Labels[I] = ByteLabels[0];
     }
@@ -1947,6 +1992,27 @@ Value* State::foldInst(Instruction* Inst) {
   }
 
   return Inst;
+}
+
+SmallVector<Label, 8> State::labelInst(StackFrame* SF, Instruction* Inst) {
+  // Handle each folded instruction.
+  for (unsigned I = 0; I < Inst->getNumOperands(); ++I) {
+    auto Operand = Inst->getOperand(I);
+    auto const& OperandL = SF->getLabels(Operand);
+    for (unsigned J = 0; J < OperandL.size(); ++J) {
+      if (OperandL[J] != BOTTOM) {
+        return MaybeTaintedLabels;
+      }
+    }
+  }
+
+  return EmptyLabels;
+}
+
+void State::checkBottom(SmallVector<Label, 8> L) {
+  for (unsigned I = 0; I < L.size(); ++I) {
+    assert(L[I] == BOTTOM && "Invalid label. Must be BOTTOM.");
+  }
 }
 
 Value* State::foldAndEmitInst(Instruction* Inst) {
@@ -2846,7 +2912,7 @@ void State::updateMemory() {
       }
 
       for (unsigned I = 0; I < Op.Labels.size(); ++I) {
-        if (Op.Labels[I] != UNTAINTED) {
+        if (Op.Labels[I] != BOTTOM) {
           Labels.push_back(std::make_pair(Op.Offset + I, Op.Labels[I]));
         }
       }
