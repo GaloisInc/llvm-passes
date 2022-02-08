@@ -1346,9 +1346,10 @@ bool State::stepCall(
     return false;
   }
   if (Callee->getName() == "noniSinkU8") {
-    // Stop if we hit a sink.
-    errs() << "encountered `noniSinkU8` during public memory folding. " << *Call << "\n";
-    return false;
+    // A no-op, for our purposes.
+    Stack.back().advance(NormalDest);
+    Call->deleteValue();
+    return true;
   }
 
   if (Callee->isDeclaration()) {
