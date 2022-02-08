@@ -999,22 +999,19 @@ bool State::step() {
 
   if (auto Branch = dyn_cast<BranchInst>(Inst)) {
     if (Branch->isUnconditional()) {
-      // Checks on target.
+      // Taint analysis checks on target are unnecessary since the successor is a compile-time constant.
       auto Succ = Branch->getSuccessor(0);
-      auto const& TargetL = SF.getLabels(Succ);
-      checkBottom(TargetL);
 
       SF.enterBlock(Succ);
       Inst->deleteValue();
       return true;
     } else {
       if (auto ConstCond = dyn_cast<Constant>(Branch->getCondition())) {
-        // Checks on target and conditional.
+        // Checks on conditional.
         auto const& CondL = SF.getLabels(ConstCond);
         checkBottom(CondL);
+        // Taint analysis checks on target are unnecessary since the successor is a compile-time constant.
         auto Succ = ConstCond->isOneValue() ? Branch->getSuccessor(0) : Branch->getSuccessor(1);
-        auto const& TargetL = SF.getLabels(Succ);
-        checkBottom(TargetL);
 
         SF.enterBlock(Succ);
         Inst->deleteValue();
@@ -1027,15 +1024,13 @@ bool State::step() {
       // Checks on target and conditional.
       auto const& CondL = SF.getLabels(ConstCond);
       checkBottom(CondL);
+      // Taint analysis checks on target are unnecessary since the successor is a compile-time constant.
       auto Succ = Switch->findCaseValue(ConstCond)->getCaseSuccessor();
-      auto const& TargetL = SF.getLabels(Succ);
-      checkBottom(TargetL);
 
       SF.enterBlock(Succ);
       Inst->deleteValue();
       return true;
     }
-    // JP: Should we exit out? It's fine to pass it through?
   }
 
   if (auto Load = dyn_cast<LoadInst>(Inst)) {
@@ -1083,7 +1078,6 @@ bool State::step() {
       ++SF.Iter;
       return true;
     }
-    // JP: Should we exit out if alloca fails? It's fine to pass it through?
   }
 
 
